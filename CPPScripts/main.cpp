@@ -1,6 +1,25 @@
 #include <iostream>
 #include <vector>
 #include <set>
+#include <fstream>
+#include <string>
+using std::string;
+
+std::ofstream ofs;
+void PrepareLog() {
+    // 写个空字符串清除一下上一次运行的日志
+    ofs.open("../../log.txt", std::ios::out);
+    ofs << "";
+    ofs.close();
+    // 重新以追加写入模式打开
+    ofs.open("../../log.txt", std::ios::out | std::ios::app);
+}
+void Log(string msg) {
+    ofs << msg << std::endl;
+}
+void EndLog() {
+    ofs.close();
+}
 
 // 用GLFW的话这里就不要自己去include Vulkan的头文件，用这个宏定义，让GLFW自己去处理，不然有些接口有问题
 #define GLFW_INCLUDE_VULKAN
@@ -93,6 +112,10 @@ private:
     // 设备队列在设备被销毁的时候隐式清理，所以我们不需要在cleanup函数中做任何操作
     VkQueue graphicsQueue;
     VkQueue presentQueue;
+    // 显示图像的交换链
+    VkSwapchainKHR swapChain;
+    // 交换链的图像,图像被交换链创建,也会在交换链销毁的同时自动清理,所以我们不需要添加任何清理代码
+    std::vector<VkImage> swapChainImages;
 
     void initWindow() {
         glfwInit();
@@ -120,6 +143,7 @@ private:
     }
 
     void cleanup() {
+        vkDestroySwapchainKHR(device, swapChain, nullptr);
         vkDestroyDevice(device, nullptr);
         DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         vkDestroySurfaceKHR(instance, surface, nullptr);
@@ -131,7 +155,7 @@ private:
     void createInstance() {
         // 如果开启了验证层，那么我们在validationLayers里自定义的所需验证层需要全部被支持
         if (enableValidationLayers && !checkValidationLayerSupport())
-            throw std::runtime_error("validation layers requested, but not available!");
+            throw std::runtime_error("Validation layers requested, but not available!\nPlease check whether your SDK is installed correctly.");
 
         // 这些数据从技术角度是可选择的，但是它可以为驱动程序提供一些有用的信息来优化程序特殊的使用情景，比如驱动程序使用一些图形引擎的特殊行为。
         VkApplicationInfo appInfo = {};
@@ -233,6 +257,7 @@ private:
     // 自定义的Debug回调函数，VKAPI_ATTR和VKAPI_CALL确保了正确的函数签名，从而被Vulkan调用
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData) {
         std::cerr << "My debug call back: " << pCallbackData->pMessage << std::endl;
+        Log(pCallbackData->pMessage);
         // 返回一个布尔值，表明触发validation layer消息的Vulkan调用是否应被中止
         // 如果返回true，则调用将以VK_ERROR_VALIDATION_FAILED_EXT错误中止
         // 这通常用于测试validation layers本身，所以我们总是返回VK_FALSE
@@ -446,6 +471,96 @@ private:
         vkGetDeviceQueue(device, indices.presentFamily, 0, &presentQueue);
     }
 
+    void createSwapChain() {
+        // 查询硬件支持的交换链设置
+        SwapChainSupportDetails swapChainSupport = querySwapChainSupport(physicalDevice);
+
+        // 选择一个图像格式
+        VkSurfaceFormatKHR surfaceFormat = chooseSwapSurfaceFormat(swapChainSupport.formats);
+        // 选择一个present模式(就是图像交换的模式)
+        VkPresentModeKHR presentMode = chooseSwapPresentMode(swapChainSupport.presentModes);
+        // 选择一个合适的图像分辨率
+        VkExtent2D extent = chooseSwapExtent(swapChainSupport.capabilities);
+
+        // 交换链中的图像数量，可以理解为交换队列的长度。它指定运行时图像的最小数量，我们将尝试大于1的图像数量，以实现三重缓冲。
+        uint32_t imageCount = swapChainSupport.capabilities.minImageCount + 1;
+        // 如果maxImageCount等于0，就表示没有限制。如果大于0就表示有限制，那么我们最大只能设置到maxImageCount
+        if (swapChainSupport.capabilities.maxImageCount > 0 && imageCount > swapChainSupport.capabilities.maxImageCount) {
+            imageCount = swapChainSupport.capabilities.maxImageCount;
+        }
+
+        // 创建交换链的结构体
+        VkSwapchainCreateInfoKHR createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        // 绑定我们的surface
+        createInfo.surface = surface;
+
+        // 把前面获取的数据填上
+        createInfo.minImageCount = imageCount;
+        createInfo.imageFormat = surfaceFormat.format;
+        createInfo.imageColorSpace = surfaceFormat.colorSpace;
+        createInfo.presentMode = presentMode;
+        createInfo.imageExtent = extent;
+
+        // imageArrayLayers指定每个图像组成的层数，除非我们开发3D应用程序，否则始终为1
+        createInfo.imageArrayLayers = 1;
+        // 这个字段指定在交换链中对图像进行的具体操作
+        // 在本小节中，我们将直接对它们进行渲染，这意味着它们作为颜色附件
+        // 也可以首先将图像渲染为单独的图像，进行后处理操作
+        // 在这种情况下可以使用像VK_IMAGE_USAGE_TRANSFER_DST_BIT这样的值，并使用内存操作将渲染的图像传输到交换链图像队列
+        createInfo.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+
+        // 接下来，我们需要指定如何处理跨多个队列簇的交换链图像
+        QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
+        uint32_t queueFamilyIndices[] = { (uint32_t)indices.graphicsFamily, (uint32_t)indices.presentFamily };
+        // 如果graphics队列簇与presentation队列簇不同，会出现如下情形
+        // 我们将从graphics队列中绘制交换链的图像，然后在另一个presentation队列中提交他们
+        // 多队列处理图像有两种方法
+        // VK_SHARING_MODE_EXCLUSIVE: 同一时间图像只能被一个队列簇占用，如果其他队列簇需要其所有权需要明确指定，这种方式提供了最好的性能
+        // VK_SHARING_MODE_CONCURRENT: 图像可以被多个队列簇访问，不需要明确所有权从属关系
+        // 如果队列簇不同，暂时使用concurrent模式，避免处理图像所有权从属关系的内容，因为这些会涉及不少概念
+        if (indices.graphicsFamily != indices.presentFamily) {
+            createInfo.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+            // Concurrent模式需要预先指定队列簇所有权从属关系，通过queueFamilyIndexCount和pQueueFamilyIndices参数进行共享
+            createInfo.queueFamilyIndexCount = 2;
+            createInfo.pQueueFamilyIndices = queueFamilyIndices;
+        }
+        // 如果graphics队列簇和presentation队列簇相同，我们需要使用exclusive模式，因为concurrent模式需要至少两个不同的队列簇
+        else {
+            createInfo.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            createInfo.queueFamilyIndexCount = 0; // Optional
+            createInfo.pQueueFamilyIndices = nullptr; // Optional
+        }
+
+        // 如果交换链支持(supportedTransforms in capabilities)，我们可以为交换链图像指定某些转换逻辑
+        // 比如90度顺时针旋转或者水平反转。如果不需要任何transoform操作，可以简单的设置为currentTransoform
+        createInfo.preTransform = swapChainSupport.capabilities.currentTransform;
+
+        // compositeAlpha字段指定alpha通道是否应用于与其他的窗体系统进行混合操作。如果忽略该功能，简单的填VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR
+        createInfo.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+
+        // 如果clipped成员设置为VK_TRUE，意味着我们不关心被遮蔽的像素数据，比如由于其他的窗体置于前方时或者渲染的部分内容存在于可是区域之外
+        // 除非真的需要读取这些像素获数据进行处理，否则可以开启裁剪获得最佳性能
+        createInfo.clipped = VK_TRUE;
+
+        // Vulkan运行时，交换链可能在某些条件下被替换，比如窗口调整大小或者交换链需要重新分配更大的图像队列
+        // 在这种情况下，交换链实际上需要重新分配创建，并且必须在此字段中指定对旧的引用，用以回收资源
+        // 这是一个比较复杂的话题，我们会在后面的章节中详细介绍。现在假设我们只会创建一个交换链。
+        createInfo.oldSwapchain = VK_NULL_HANDLE;
+
+        // 最终创建交换链
+        if (vkCreateSwapchainKHR(device, &createInfo, nullptr, &swapChain) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create swap chain!");
+        }
+
+        // 获取一下交换链里图像的数量，这个imageCount变量最开始是我们期望的图像数量，但是实际创建的不一定是这么多，所以要重新获取一下
+        vkGetSwapchainImagesKHR(device, swapChain, &imageCount, nullptr);
+        // 根据实际图像数量重新设置vector大小
+        swapChainImages.resize(imageCount);
+        // 最后，存储交换链格式和范围到成员变量swapChainImages中
+        vkGetSwapchainImagesKHR(device, swapChain, &imageCount, swapChainImages.data());
+    }
+
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) {
         SwapChainSupportDetails details;
 
@@ -477,9 +592,75 @@ private:
 
         return details;
     }
+
+    VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats) {
+        // 这是最理想的情况，surface没有设置任何偏向性的格式
+        // 这个时候Vulkan会通过仅返回一个VkSurfaceFormatKHR结构来表示，且该结构的format成员设置为VK_FORMAT_UNDEFINED
+        // 此时我们可以自由的设置格式
+        if (availableFormats.size() == 1 && availableFormats[0].format == VK_FORMAT_UNDEFINED) {
+            return { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
+        }
+
+        // 如果不能自由的设置格式，那么我们可以通过遍历列表设置具有偏向性的组合
+        for (const auto& availableFormat : availableFormats) {
+            if (availableFormat.format == VK_FORMAT_B8G8R8A8_UNORM && availableFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+                return availableFormat;
+            }
+        }
+
+        // 如果以上两种方式都失效了，我们直接选择第一个格式
+        // 其实这个时候我们也可以遍历一下availableFormats，自己写一个规则挑一个相对较好的出来
+        return availableFormats[0];
+    }
+
+    VkPresentModeKHR chooseSwapPresentMode(const std::vector<VkPresentModeKHR> availablePresentModes) {
+        // 在Vulkan中有四个模式可以使用:
+        // 1，VK_PRESENT_MODE_IMMEDIATE_KHR
+        // 应用程序提交的图像被立即传输到屏幕呈现，这种模式可能会造成撕裂效果。
+        // 2，VK_PRESENT_MODE_FIFO_KHR
+        // 交换链被看作一个队列，当显示内容需要刷新的时候，显示设备从队列的前面获取图像，并且程序将渲染完成的图像插入队列的后面。如果队列是满的程序会等待。这种规模与视频游戏的垂直同步很类似。显示设备的刷新时刻被称为“垂直中断”。
+        // 3，VK_PRESENT_MODE_FIFO_RELAXED_KHR
+        // 该模式与上一个模式略有不同的地方为，如果应用程序存在延迟，即接受最后一个垂直同步信号时队列空了，将不会等待下一个垂直同步信号，而是将图像直接传送。这样做可能导致可见的撕裂效果。
+        // 4，VK_PRESENT_MODE_MAILBOX_KHR
+        // 这是第二种模式的变种。当交换链队列满的时候，选择新的替换旧的图像，从而替代阻塞应用程序的情形。这种模式通常用来实现三重缓冲区，与标准的垂直同步双缓冲相比，它可以有效避免延迟带来的撕裂效果。
+        
+        // 默认的模式
+        VkPresentModeKHR bestMode = VK_PRESENT_MODE_FIFO_KHR;
+
+        for (const auto& availablePresentMode : availablePresentModes) {
+            if (availablePresentMode == VK_PRESENT_MODE_MAILBOX_KHR) {
+                return availablePresentMode;
+            }
+            else if (availablePresentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+                bestMode = availablePresentMode;
+            }
+        }
+
+        return bestMode;
+    }
+
+    VkExtent2D chooseSwapExtent(const VkSurfaceCapabilitiesKHR& capabilities) {
+        // SwapExtent是指交换链图像的分辨率
+
+        // currentExtent的高宽如果是一个特殊的uint32最大值，就直接返回？？？
+        if (capabilities.currentExtent.width != std::numeric_limits<uint32_t>::max()) {
+            return capabilities.currentExtent;
+        }
+        else {
+            VkExtent2D actualExtent = { WIDTH, HEIGHT };
+
+            // 收敛到minImageExtent和maxImageExtent之间
+            actualExtent.width = std::max(capabilities.minImageExtent.width, std::min(capabilities.maxImageExtent.width, actualExtent.width));
+            actualExtent.height = std::max(capabilities.minImageExtent.height, std::min(capabilities.maxImageExtent.height, actualExtent.height));
+
+            return actualExtent;
+        }
+    }
 };
 
 int main() {
+    PrepareLog();
+
     HelloTriangleApplication app;
 
     try {
@@ -489,6 +670,8 @@ int main() {
         std::cerr << e.what() << std::endl;
         return EXIT_FAILURE;
     }
+
+    EndLog();
 
     return EXIT_SUCCESS;
 }
