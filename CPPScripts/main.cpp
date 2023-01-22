@@ -21,6 +21,26 @@ void EndLog() {
     ofs.close();
 }
 
+// 读二进制文件
+static std::vector<char> readFile(const std::string& filename) {
+    // ate:在文件末尾开始读取，从文件末尾开始读取的优点是我们可以使用读取位置来确定文件的大小并分配缓冲区
+    std::ifstream file(filename, std::ios::ate | std::ios::binary);
+    if (!file.is_open())
+        throw std::runtime_error("failed to open file!");
+    
+    // 使用读取位置来确定文件的大小并分配缓冲区
+    size_t fileSize = (size_t)file.tellg();
+    std::vector<char> buffer(fileSize);
+
+    // 返回文件开头，真正读取内容
+    file.seekg(0);
+    file.read(buffer.data(), fileSize);
+
+    // 结束，返回数据
+    file.close();
+    return buffer;
+}
+
 // 用GLFW的话这里就不要自己去include Vulkan的头文件，用这个宏定义，让GLFW自己去处理，不然有些接口有问题
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -116,6 +136,18 @@ private:
     VkSwapchainKHR swapChain;
     // 交换链的图像,图像被交换链创建,也会在交换链销毁的同时自动清理,所以我们不需要添加任何清理代码
     std::vector<VkImage> swapChainImages;
+    VkFormat swapChainImageFormat;
+    VkExtent2D swapChainExtent;
+    // 使用任何的VkImage，包括在交换链或者渲染管线中的，我们都需要创建VkImageView对象
+    // 从字面上理解它就是一个针对图像的视图或容器，通过它具体的渲染管线才能够读写渲染数据，换句话说VkImage不能与渲染管线进行交互
+    // 这个不同于VkImage，是手动创建的，所以需要手动销毁
+    std::vector<VkImageView> swapChainImageViews;
+    
+    VkRenderPass renderPass;
+    // 这个就是glsl里面在开头写的那个layout
+    VkPipelineLayout pipelineLayout;
+
+    VkPipeline graphicsPipeline;
 
     void initWindow() {
         glfwInit();
@@ -134,6 +166,10 @@ private:
         // 在系统中查找并选择支持我们所需功能的显卡
         pickPhysicalDevice();
         createLogicalDevice();
+        createSwapChain();
+        createImageViews();
+        createRenderPass();
+        createGraphicsPipeline();
     }
 
     void mainLoop() {
@@ -143,6 +179,12 @@ private:
     }
 
     void cleanup() {
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        vkDestroyRenderPass(device, renderPass, nullptr);
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+            vkDestroyImageView(device, swapChainImageViews[i], nullptr);
+        }
         vkDestroySwapchainKHR(device, swapChain, nullptr);
         vkDestroyDevice(device, nullptr);
         DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
@@ -559,6 +601,9 @@ private:
         swapChainImages.resize(imageCount);
         // 最后，存储交换链格式和范围到成员变量swapChainImages中
         vkGetSwapchainImagesKHR(device, swapChain, &imageCount, swapChainImages.data());
+
+        swapChainImageFormat = surfaceFormat.format;
+        swapChainExtent = extent;
     }
 
     SwapChainSupportDetails querySwapChainSupport(VkPhysicalDevice device) {
@@ -655,6 +700,343 @@ private:
 
             return actualExtent;
         }
+    }
+
+    void createImageViews() {
+        // size和swapChainImages一致
+        swapChainImageViews.resize(swapChainImages.size());
+
+        // 循环遍历swapChainImages来创建swapChainImageViews
+        for (size_t i = 0; i < swapChainImages.size(); i++) {
+            VkImageViewCreateInfo createInfo = {};
+            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            createInfo.image = swapChainImages[i];
+
+            // 可以是1D，2D，3D或者CubeMap纹理
+            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            // 用之前创建swapChainImages时候的格式
+            createInfo.format = swapChainImageFormat;
+
+            // components字段允许调整颜色通道的最终的映射逻辑
+            // 比如，我们可以将所有颜色通道映射为红色通道，以实现单色纹理，我们也可以将通道映射具体的常量数值0和1
+            // 这里用默认的
+            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+
+            // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域
+            // 这个图像用作填充color(可以是深度，stencil等)
+            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            // 没有mipmap
+            createInfo.subresourceRange.baseMipLevel = 0;
+            createInfo.subresourceRange.levelCount = 1;
+            // 没有multiple layer (如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要)
+            createInfo.subresourceRange.baseArrayLayer = 0;
+            createInfo.subresourceRange.layerCount = 1;
+
+            // 创建一个VkImageView
+            if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create image views!");
+            }
+        }
+    }
+
+    void createRenderPass() {
+        // 创建一个color buffer
+        // 实际上这个VkAttachmentDescription可以是任何buffer的创建，只是这里我们创建的是一个单纯的color buffer
+        VkAttachmentDescription colorAttachment = {};
+        // 和交换链里的图片格式保持一致
+        colorAttachment.format = swapChainImageFormat;
+        // 不启用多重采样的话这里就是1bit
+        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        // loadOp是渲染前的操作
+        // VK_ATTACHMENT_LOAD_OP_LOAD: 保存已经存在于当前buffer的内容
+        // VK_ATTACHMENT_LOAD_OP_CLEAR: 起始阶段以一个常量清理内容
+        // VK_ATTACHMENT_LOAD_OP_DONT_CARE: 存在的内容未定义，忽略它们
+        colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        // storeOp是渲染之后怎么处理
+        // VK_ATTACHMENT_STORE_OP_STORE: 渲染内容存储下来，并在之后进行读取操作
+        // VK_ATTACHMENT_STORE_OP_DONT_CARE: 帧缓冲区的内容在渲染操作完毕后设置为未定义(不是很懂这个，可能是搞一些骚操作的吧)
+        colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        // 上面那个设置是用于color和depth的，stencil的单独一个
+        colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        // Vulkan里的textures和framebuffers都是用一个确定的format的VkImage来表示，但是layout是可以动态改的
+        // 这个layout主要是影响内存的读写方式，可以根据你具体要做什么来选择合适的layout
+        // 有3种:
+        // VK_IMAGE_LAYOUT_COLOR_ATTACHMET_OPTIMAL: 图像作为颜色附件
+        // VK_IMAGE_LAYOUT_PRESENT_SRC_KHR: 图像在交换链中被呈现
+        // VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL : 图像作为目标，用于内存COPY操作
+        // initialLayout指的是在进入当前这个render pass之前的layout，这里我们不关心，就设置为UNDEFINED
+        // 但是这里如果设置为UNDEFINED，是不能保证数据可以保留下来的，不过本来我们loadOp也设置成了clear，所以无所谓
+        colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // finalLayout指的是，当前render pass处理完了之后，会把数据设置为什么layout
+        // 这里设置为PRESENT_SRC_KHR是因为我们准备直接把数据给交换链
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+
+        // 一个单独的渲染pass可以由多个subpass组成。subpass是一系列取决于前一个pass输出结果的渲染操作序列
+        // 比如说后处理效果的序列通常每一步都依赖之前的操作
+        // 如果将这些渲染操作分组到一个渲染pass中，则Vulkan能够重新排序这些操作并节省内存带宽，以获得可能更好的性能
+        // 对于我们要绘制的三角形，我们只需要一个subpass
+
+        // 每个subpass都需要引用一个或多个attachment，这些attachment是我们之前用的的结构体描述的
+        // 这些引用本身是用VkAttachmentReference来表示的
+        VkAttachmentReference colorAttachmentRef{};
+        // 引用的attachment在attachment descriptions array里的索引，我们只有一个VkAttachmentDescription，所以用0
+        colorAttachmentRef.attachment = 0;
+        // 这个指定了当subpass开始的时候，我们引用的attachment会被Vulkan自动转换成哪种layout
+        // 因为我们这个attachment是用作color buffer的，所以我们用这个COLOR_ATTACHMENT_OPTIMAL来达到最佳性能
+        colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
+        // 描述subpass的结构体
+        VkSubpassDescription subpass{};
+        // 做图形渲染这里就用这个，因为Vulkan也会支持一些非图形的工作
+        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        // 指定color buffer的引用，这个应用以及它的索引(上面的attachment = 0)现在直接对应到片元着色器里的layout(location = 0) out vec4 outColor了
+        subpass.pColorAttachments = &colorAttachmentRef;
+        subpass.colorAttachmentCount = 1;
+        // 除了colorAttachment，还有这些可以引用
+        // pInputAttachments: 从shader中读取
+        // pResolveAttachments: 用于颜色附件的多重采样
+        // pDepthStencilAttachment: 用于depth和stencil数据
+        // pPreserveAttachments: 不被这个subpass使用，但是数据要保存
+
+        // 创建render pass的信息
+        VkRenderPassCreateInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+        renderPassInfo.attachmentCount = 1;
+        // 前面创建VkAttachmentReference的时候，那个索引attachment指的就是在这个pAttachments数组里的索引
+        // 这里是可以传数组的，不过我们只创建了一个，所以也只传了一个
+        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.subpassCount = 1;
+        renderPassInfo.pSubpasses = &subpass;
+
+        if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create render pass!");
+        }
+    }
+
+    void createGraphicsPipeline() {
+        auto vertShaderCode = readFile("../../Shader/triangle.vert.spv");
+        auto fragShaderCode = readFile("../../Shader/triangle.frag.spv");
+
+        VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
+        VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
+
+        VkPipelineShaderStageCreateInfo vertShaderStageInfo = {};
+        vertShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        // 指定为顶点着色器
+        vertShaderStageInfo.stage = VK_SHADER_STAGE_VERTEX_BIT;
+        // 指定包含代码的着色器模块和shader里的主函数名
+        // 可以将多个片段着色器组合到单个着色器模块中，并使用不同的入口点来区分它们的行为
+        vertShaderStageInfo.module = vertShaderModule;
+        vertShaderStageInfo.pName = "main";
+        // 这个可以给着色器指定常量值。使用单个着色器模块，通过为其中使用不同的常量值，可以在流水线创建时对行为进行配置
+        // 这比在渲染时使用变量配置着色器更有效率，因为编译器可以进行优化，例如消除if值判断的语句
+        vertShaderStageInfo.pSpecializationInfo = nullptr;
+
+        // 片元着色器，和上面的一样，就不逐一解释了
+        VkPipelineShaderStageCreateInfo fragShaderStageInfo = {};
+        fragShaderStageInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        fragShaderStageInfo.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        fragShaderStageInfo.module = fragShaderModule;
+        fragShaderStageInfo.pName = "main";
+
+        VkPipelineShaderStageCreateInfo shaderStages[] = { vertShaderStageInfo, fragShaderStageInfo };
+
+        // 结构体描述了顶点数据的格式，该结构体数据传递到vertex shader中
+        VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
+        vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        // Bindings:根据数据的间隙，确定数据是每个顶点或者是每个instance(instancing)
+        vertexInputInfo.vertexBindingDescriptionCount = 0;
+        vertexInputInfo.pVertexBindingDescriptions = nullptr; // Optional
+        // Attribute:描述将要进行绑定及加载属性的顶点着色器中的相关属性类型
+        vertexInputInfo.vertexAttributeDescriptionCount = 0;
+        vertexInputInfo.pVertexAttributeDescriptions = nullptr; // Optional
+
+        // 这个结构体描述两件事情:顶点数据以什么类型的几何图元拓扑进行绘制及是否启用顶点索重新开始图元
+        VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
+        inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+        // VK_PRIMITIVE_TOPOLOGY_POINT_LIST: 点图元
+        // VK_PRIMITIVE_TOPOLOGY_LINE_LIST: 线图元，顶点不共用
+        // VK_PRIMITIVE_TOPOLOGY_LINE_STRIP : 线图元，每个线段的结束顶点作为下一个线段的开始顶点
+        // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : 三角形图元，顶点不共用
+        // VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP : 三角形图元，每个三角形的第二个、第三个顶点都作为下一个三角形的前两个顶点
+        // 感觉LIST就是OpenGL里的DrawArray，STRIP就是DrawElement
+        inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        // 这个是用于_STRIP类型的图元，这个设置为VK_TRUE后，可以用0xFFFF或者0xFFFFFFFF当作element buffer里的下标来断开和下一个图元顶点的重复使用
+        inputAssembly.primitiveRestartEnable = VK_FALSE;
+
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = (float)swapChainExtent.width;
+        viewport.height = (float)swapChainExtent.height;
+        // 手动指定深度范围，但是需要收敛到0-1之间，教程里说minDepth may be higher than maxDepth? 
+        // 不是很懂，反正一般就设置为0和1就行
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+
+        // 裁剪区域，一般来说不做任何裁剪的话，offset和高宽(也就是extent)和viewport的保持一致就行
+        VkRect2D scissor{};
+        scissor.offset = { 0, 0 };
+        scissor.extent = swapChainExtent;
+
+        // viewport和scissor也可以不在创建Pipeline的时候确定，而是作为一个动态的设置在后续绘制的时候指定
+        std::vector<VkDynamicState> dynamicStates = {
+            VK_DYNAMIC_STATE_VIEWPORT,
+            VK_DYNAMIC_STATE_SCISSOR
+        };
+        VkPipelineDynamicStateCreateInfo dynamicState{};
+        dynamicState.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+        dynamicState.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
+        dynamicState.pDynamicStates = dynamicStates.data();
+
+        // VkViewport和scissor信息一起填充到这里
+        // 这个填充了之后viewport和scissor相当于变成固定管线的一部分了，也可以弄成动态的放到command buffer里去设置
+        // 见:https://vulkan-tutorial.com/Drawing_a_triangle/Graphics_pipeline_basics/Fixed_functions#page_Viewports-and-scissors
+        VkPipelineViewportStateCreateInfo viewportState{};
+        viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+        viewportState.viewportCount = 1;
+        viewportState.scissorCount = 1;
+        // 如果要弄成动态的，这里就不设置，如果这里直接设置了，那这个pipeline的viewport和scissor之后就不能再改了
+        // viewportState.pViewports = &viewport;
+        // viewportState.pScissors = &scissor;
+
+        // 光栅化阶段信息
+        VkPipelineRasterizationStateCreateInfo rasterizer = {};
+        rasterizer.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+        // 如果depthClampEnable设置为VK_TRUE，超过远近裁剪面的片元会进行收敛，而不是丢弃它们
+        // 它在特殊的情况下比较有用，像阴影贴图。使用该功能需要得到GPU的支持
+        rasterizer.depthClampEnable = VK_FALSE;
+        // 如果rasterizerDiscardEnable设置为VK_TRUE，那么几何图元永远不会传递到光栅化阶段
+        // 这是禁止任何数据输出到framebuffer的方法
+        rasterizer.rasterizerDiscardEnable = VK_FALSE;
+        // 这个指定片元如何从几何模型中产生，一般正常情况都是FILL，如果不是的话，需要开启GPU feature
+        // VK_POLYGON_MODE_FILL: 多边形区域填充
+        // VK_POLYGON_MODE_LINE: 多边形边缘线框绘制
+        // VK_POLYGON_MODE_POINT : 多边形顶点作为描点绘制
+        rasterizer.polygonMode = VK_POLYGON_MODE_FILL;
+        // 这个变量的意思是，用多少片元的数量来描述线的宽度，一般都是1，如果要大于1，需要开启wideLines这个GPU feature
+        rasterizer.lineWidth = 1.0f;
+        // 这个就是FaceCull，这里用背面裁剪
+        rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
+        // 设置怎么判断正面
+        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        // 这些设置一般是渲染阴影贴图用的，暂时用不到
+        rasterizer.depthBiasEnable = VK_FALSE;
+        rasterizer.depthBiasConstantFactor = 0.0f; // Optional
+        rasterizer.depthBiasClamp = 0.0f; // Optional
+        rasterizer.depthBiasSlopeFactor = 0.0f; // Optional
+        // 设置多重采样
+        VkPipelineMultisampleStateCreateInfo multisampling{};
+        multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        multisampling.sampleShadingEnable = VK_FALSE;
+        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+        multisampling.minSampleShading = 1.0f; // Optional
+        multisampling.pSampleMask = nullptr; // Optional
+        multisampling.alphaToCoverageEnable = VK_FALSE; // Optional
+        multisampling.alphaToOneEnable = VK_FALSE; // Optional
+        // 配置色彩混合方式
+        VkPipelineColorBlendAttachmentState colorBlendAttachment{};
+        colorBlendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        colorBlendAttachment.blendEnable = VK_TRUE;
+        colorBlendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+        colorBlendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        colorBlendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
+        colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
+        // 这个也是设置色彩回合的一种方式，并且是一个全局的设置，如果这个开了，上面的那个设置就会失效，相当于上面的blendEnable = VK_FALSE
+        // 这个还不是很懂，先不用这个
+        VkPipelineColorBlendStateCreateInfo colorBlending{};
+        colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+        colorBlending.logicOpEnable = VK_FALSE;
+        colorBlending.logicOp = VK_LOGIC_OP_COPY; // Optional
+        colorBlending.attachmentCount = 1;
+        colorBlending.pAttachments = &colorBlendAttachment;
+        colorBlending.blendConstants[0] = 0.0f; // Optional
+        colorBlending.blendConstants[1] = 0.0f; // Optional
+        colorBlending.blendConstants[2] = 0.0f; // Optional
+        colorBlending.blendConstants[3] = 0.0f; // Optional
+
+        // shader开头写的那个layout，这里暂时不设置
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
+        pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+        pipelineLayoutInfo.setLayoutCount = 0; // Optional
+        pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+        pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
+        pipelineLayoutInfo.pPushConstantRanges = nullptr; // Optional
+        // 创建PipelineLayout，并保存到成员变量，后续会用
+        if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create pipeline layout!");
+        }
+
+
+        // 终于开始用上面一大堆东西构建pipeLineInfo了......
+        VkGraphicsPipelineCreateInfo pipelineInfo{};
+        pipelineInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        // 因为我们只写了vert和frag shader，所以是2个shader stage
+        pipelineInfo.stageCount = 2;
+        // 传入具体的shader
+        pipelineInfo.pStages = shaderStages;
+        // 下面这堆是前面写的各种固定管线配置信息
+        pipelineInfo.pVertexInputState = &vertexInputInfo;
+        pipelineInfo.pInputAssemblyState = &inputAssembly;
+        pipelineInfo.pViewportState = &viewportState;
+        pipelineInfo.pRasterizationState = &rasterizer;
+        pipelineInfo.pMultisampleState = &multisampling;
+        pipelineInfo.pDepthStencilState = nullptr; // Optional
+        pipelineInfo.pColorBlendState = &colorBlending;
+        pipelineInfo.pDynamicState = &dynamicState;
+        // layout
+        pipelineInfo.layout = pipelineLayout;
+        // 这个管线用的renderPass
+        // 我们这里因为只有一个管线和一个pass，所以就是一一对应的，其实可以创建一个pass然后用到很多个管线上
+        // 只不过需要这些pass满足一些兼容需求:https://registry.khronos.org/vulkan/specs/1.3-extensions/html/chap8.html#renderpass-compatibility
+        pipelineInfo.renderPass = renderPass;
+        // 具体用的哪个subpass
+        pipelineInfo.subpass = 0;
+
+        // 这两个参数是可以实现通过集成另一个已有的管线，来创建当前管线
+        // 如果两个管线之间的差别比较小，就可以通过这样继承来创建，并且切换的时候也比较高效
+        pipelineInfo.basePipelineHandle = VK_NULL_HANDLE; // Optional
+        pipelineInfo.basePipelineIndex = -1; // Optional
+        // 如果要用上面两个参数来指定继承的话，需要这样设置这个flags
+        // pipelineInfo.flags = VK_PIPELINE_CREATE_DERIVATIVE_BIT;
+
+        // 创建渲染管线，这个函数可以接收VkGraphicsPipelineCreateInfo数组然后一次性创建多个管线
+        // 第二个参数是VkPipelineCache，这个可以存储管线创建的数据，然后在多次vkCreateGraphicsPipelines调用中使用
+        // 甚至可以存到文件里，在不同的Vulkan程序里使用
+        if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &graphicsPipeline) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create graphics pipeline!");
+        }
+
+        // 管线创建好后就没用了，所以立刻删除
+        vkDestroyShaderModule(device, fragShaderModule, nullptr);
+        vkDestroyShaderModule(device, vertShaderModule, nullptr);
+    }
+
+    // VkShaderModule对象只是字节码缓冲区的一个包装容器。着色器并没有彼此链接，甚至没有给出目的
+    // 后续需要通过VkPipelineShaderStageCreateInfo结构将着色器模块分配到管线中的顶点或者片段着色器阶段
+    VkShaderModule createShaderModule(const std::vector<char>& code) {
+        VkShaderModuleCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+        // 这里貌似需要确保数据满足uint32_t的对齐要求
+        // 不过数据存储在std::vector中，默认分配器已经确保数据满足最差情况下的对齐要求
+        createInfo.codeSize = code.size();
+        // 字节码的大小是以字节指定的，但是字节码指针是一个uint32_t类型的指针，而不是一个char指针
+        createInfo.pCode = reinterpret_cast<const uint32_t*>(code.data());
+
+        // 创建VkShaderModule
+        VkShaderModule shaderModule;
+        if (vkCreateShaderModule(device, &createInfo, nullptr, &shaderModule) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create shader module!");
+        }
+
+        return shaderModule;
     }
 };
 
