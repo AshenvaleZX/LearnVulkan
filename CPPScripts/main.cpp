@@ -142,6 +142,12 @@ private:
     // 从字面上理解它就是一个针对图像的视图或容器，通过它具体的渲染管线才能够读写渲染数据，换句话说VkImage不能与渲染管线进行交互
     // 这个不同于VkImage，是手动创建的，所以需要手动销毁
     std::vector<VkImageView> swapChainImageViews;
+    // 给交换链中每一个VkImage建立一个帧缓冲区
+    std::vector<VkFramebuffer> swapChainFramebuffers;
+    // VkCommandPool是用来管理存储command buffer的内存和分配command buffer的
+    VkCommandPool commandPool;
+    // 从CommandPool里分配的，CommandPool销毁的时候会自动销毁
+    VkCommandBuffer commandBuffer;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
@@ -170,6 +176,9 @@ private:
         createImageViews();
         createRenderPass();
         createGraphicsPipeline();
+        createFramebuffers();
+        createCommandPool();
+        createCommandBuffer();
     }
 
     void mainLoop() {
@@ -179,6 +188,10 @@ private:
     }
 
     void cleanup() {
+        vkDestroyCommandPool(device, commandPool, nullptr);
+        for (auto framebuffer : swapChainFramebuffers) {
+            vkDestroyFramebuffer(device, framebuffer, nullptr);
+        }
         vkDestroyPipeline(device, graphicsPipeline, nullptr);
         vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
         vkDestroyRenderPass(device, renderPass, nullptr);
@@ -1037,6 +1050,93 @@ private:
         }
 
         return shaderModule;
+    }
+
+    void createFramebuffers() {
+        swapChainFramebuffers.resize(swapChainImageViews.size());
+
+        for (size_t i = 0; i < swapChainImageViews.size(); i++) {
+            VkImageView attachments[] = {
+                swapChainImageViews[i]
+            };
+
+            VkFramebufferCreateInfo framebufferInfo{};
+            framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+            // 指定可以兼容的render pass(大致就是这个frame buffer和指定的render pass的attachment的数量和类型需要一致)
+            framebufferInfo.renderPass = renderPass;
+            // 指定attach上去的VkImageView数组和数量(数组长度)
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = attachments;
+            framebufferInfo.width = swapChainExtent.width;
+            framebufferInfo.height = swapChainExtent.height;
+            // layer是指定图像数组中的层数。我们的交换链图像是单个图像，因此层数为1(没看懂)
+            framebufferInfo.layers = 1;
+
+            if (vkCreateFramebuffer(device, &framebufferInfo, nullptr, &swapChainFramebuffers[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create framebuffer!");
+            }
+        }
+    }
+
+    void createCommandPool() {
+        QueueFamilyIndices queueFamilyIndices = findQueueFamilies(physicalDevice);
+
+        VkCommandPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+        // 这个flags可要可不要，如果要多个flags的话用|即可
+        // VK_COMMAND_POOL_CREATE_TRANSIENT_BIT: 提示命令缓冲区非常频繁的重新记录新命令(可能会改变内存分配行为)
+        // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT: 允许命令缓冲区单独重新记录，没有这个标志，所有的命令缓冲区都必须一起重置
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        // command buffer是通过在一个设备队列上提交它们来执行的，每个命令池只能分配在单一类型队列上提交的命令缓冲区
+        // 我们将记录用于绘图的命令，所以用graphicsFamily
+        poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily;
+
+        if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create command pool!");
+        }
+    }
+
+    void createCommandBuffer() {
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.commandPool = commandPool;
+        // VK_COMMAND_BUFFER_LEVEL_PRIMARY: 可以提交到队列执行，但不能从其他的命令缓冲区调用
+        // VK_COMMAND_BUFFER_LEVEL_SECONDARY: 无法直接提交，但是可以从主命令缓冲区调用
+        // 如果有一些Command Buffer是差不多的，可以通过SECONDARY来实现一些通用的操作
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        // 我们这里只申请一个command buffer
+        allocInfo.commandBufferCount = 1;
+
+        if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate command buffers!");
+        }
+    }
+
+    // 实际填充一个command buffer信息
+    // imageIndex是当前交换链中图像的索引
+    void recordCommandBuffer(VkCommandBuffer commandBuffer, uint32_t imageIndex) {
+        // 通过vkBeginCommandBuffer来开启命令缓冲区的记录功能
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        // flags标志位参数用于指定如何使用命令缓冲区，可选的参数类型如下
+        // VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT: 命令缓冲区将在执行一次后立即重新记录
+        // VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT: 这是一个LEVEL_SECONDARY的command buffer，它只能在一个render pass中使用
+        // VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT: The command buffer can be resubmitted while it is also already pending execution.(没看懂)
+        beginInfo.flags = 0; // Optional
+        // 仅拱LEVEL_SECONDARY使用
+        beginInfo.pInheritanceInfo = nullptr; // Optional
+
+        // 创建command buffer
+        // 如果传入的command buffer是已经创建过的，这个调用会重置command buffer
+        // It's not possible to append commands to a buffer at a later time.(我怎么感觉现在也没有append上去呢)
+        if (vkBeginCommandBuffer(commandBuffer, &beginInfo) != VK_SUCCESS) {
+            throw std::runtime_error("failed to begin recording command buffer!");
+        }
+
+        VkRenderPassBeginInfo renderPassInfo{};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = renderPass;
+        renderPassInfo.framebuffer = swapChainFramebuffers[imageIndex];
     }
 };
 
