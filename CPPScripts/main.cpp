@@ -152,8 +152,15 @@ private:
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
     VkPipelineLayout pipelineLayout;
-
+    // 用于渲染图形的管线(做游戏基本上都是图形管线，不过Vulkan是设计成可以完成其他各种需要GPU的工作的)
     VkPipeline graphicsPipeline;
+
+    // 已从交换链获取图形并且可以用于渲染的同步信号
+    VkSemaphore imageAvailableSemaphore;
+    // 渲染已完成的同步信号
+    VkSemaphore renderFinishedSemaphore;
+    // 一次只渲染一帧画面的同步信号
+    VkFence inFlightFence;
 
     void initWindow() {
         glfwInit();
@@ -179,15 +186,25 @@ private:
         createFramebuffers();
         createCommandPool();
         createCommandBuffer();
+        createSyncObjects();
     }
 
     void mainLoop() {
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
+            drawFrame();
         }
+
+        // 因为drawFrame函数里调用的绘制图形的接口，很多都是异步执行的，所以while循环结束后，可能那些代码还在执行
+        // 这个时候如果直接结束主循环，开始调用cleanup销毁各种Vulkan对象，很有可能销毁到正在使用的对象，就会Crash
+        // 所以调用这个接口等待逻辑设备上的所有command队列执行完毕，再结束主循环
+        vkDeviceWaitIdle(device);
     }
 
     void cleanup() {
+        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
+        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
+        vkDestroyFence(device, inFlightFence, nullptr);
         vkDestroyCommandPool(device, commandPool, nullptr);
         for (auto framebuffer : swapChainFramebuffers) {
             vkDestroyFramebuffer(device, framebuffer, nullptr);
@@ -826,6 +843,64 @@ private:
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
 
+        // 定义Subpass之间的依赖关系
+        VkSubpassDependency dependency{};
+        // 定义当前这个依赖是从srcSubpass到dstSubpass的，这里填pSubpasses数组的索引
+        // 换句话说，当前定义的这个依赖关系，就是当pSubpasses[srcSubpass]结束，要进入pSubpasses[dstSubpass]时候的
+        // 如果填VK_SUBPASS_EXTERNAL，就代表是当前这个Pass外部的
+        // 比如这里srcSubpass填VK_SUBPASS_EXTERNAL，dstSubpass填0，就表示这是进入当前Pass的第一个Subpass时，需要的一些依赖关系
+        // 注意Render Pass里的Subpass是按照pSubpasses数组的顺序执行的，所以这里的srcSubpass应该小于dstSubpass(如果是VK_SUBPASS_EXTERNAL就无所谓)
+        dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependency.dstSubpass = 0;
+
+        // 这里定义这个依赖关系主要是解决image的layout转换问题
+        // 我们在创建Render Pass的VkRenderPassCreateInfo的pAttachments参数里，传入了这个Render Pass会用到的所有attachment
+        // Subpass会通过VkAttachmentReference来引用这些attachment
+        // 而这些attachment是设置了初始和最终layout的，即initialLayout和finalLayout
+        // 
+        // 而Subpass引用Render Pass的attachment的时候，定义了一个layout，即VkAttachmentReference里的layout变量
+        // 这个layout代表当前Subpass开始的时候，将会自动把这个image的layout转换成什么格式
+        // 如果相邻两个Subpass没有使用同一个attachment，那么它们之间不存在layout转换问题
+        // 如果相邻两个Subpass使用了同一个attachment，那么这个attachment在前一个Subpass使用完之后，下一个Subpass使用之前，需要有一个layout的转换过程
+        // 这个转换是Vulkan根据我们在Subpass的attachment引用种设置的layout，自动转换的，不需要我们手动转换
+        // 但是我们需要明确定义这个转换发生的时机，这个是出于Vulkan希望尽量做到并发执行，让GPU不要闲置的设计理念，具体如下:
+        // 假如我们没有并发，完全按照线性流程执行这些Subpass，那么问题就很简单了，attachment在第一个Subpass执行完之后，改变layout，执行下一个Subpass
+        // 但是这个layout实际上只影响image的读写，而image是在整个渲染流程的后期才会用到，前面的vertex shader等阶段的执行和image无关
+        // 也就是说，我们可以在第一个Subpass还没执行完的时候，就先开始并发执行第二个Subpass
+        // 但是同一个attachment肯定不允许多个Subpass同时读写，也就是说虽然第二个Subpass可以不用等第一个Subpass完全结束了再开始执行
+        // 但是第二个Subpass如果需要用到和第一个Subpass相同的attachment时，还是需要等待第一个Subpass用完这个attachment，第二个Subpass才能对其进行访问
+        // 所以定义这个依赖关系，要解决的就是问题就是:
+        // 1，前一个Subpass到底什么时候用完这个attachment
+        // 2，下一个Subpass到底什么时候开始需要使用这个attachment
+        // 那么一个attachment的layout的转换，就会发生在前一个Subpass使用完它之后，下一个Subpass需要使用它之前，我们就需要明确定义这两个时机具体是什么
+        // 如果前一个Subpass还在使用中，下一个Subpass就已经进行到需要使用它的阶段了，那么下一个Subpass的执行就会进入等待
+        // 如果下一个Subpass执行到了需要使用相同attachment的时候，前一个Subpass已经使用完了(或者不会使用相同attachment)，那么就不会出现等待，而是直接并发执行
+        // 
+        // 前面说了Render Pass的attachment是设置了初始和最终layout的，即initialLayout和finalLayout
+        // 那么Subpass之间的layout转换关系大致可以分为3类:
+        // 1，External到Subpass
+        // 2，Subpass至External
+        // 3，Subpass之间
+        // 分别对应3种layout转换关系:
+        // 1，initialLayout和首个使用该attachment的subpass所需layout不一致
+        // 2，finalLayout和最后使用该attachment的subpass所需layout不一致
+        // 3，两个subpass读取同一个attachement而且所需layout不同，且驱动实现上区分对待两种layout
+
+        // 这里设置依赖关系中，需要等待上一个Subpass具体完成什么步骤
+        // 即等待srcStageMask阶段的srcAccessMask操作完成后
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        // 等于0好像是需要等待这个阶段所有操作完全结束？
+        dependency.srcAccessMask = 0;
+
+        // 这里设置依赖关系中，下一个Subpass具体在什么步骤才开始需要等待上一个Subpass设置的步骤结束
+        // 即在dstStageMask阶段的dstAccessMask步骤执行之前，需要完成前面srcXXX设置的具体步骤
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
+        // 填充依赖关系数组
+        renderPassInfo.dependencyCount = 1;
+        renderPassInfo.pDependencies = &dependency;
+
         if (vkCreateRenderPass(device, &renderPassInfo, nullptr, &renderPass) != VK_SUCCESS) {
             throw std::runtime_error("failed to create render pass!");
         }
@@ -1133,10 +1208,147 @@ private:
             throw std::runtime_error("failed to begin recording command buffer!");
         }
 
+        // 绘制图像从使用 vkCmdBeginRenderPass 启动Render Pass开始
         VkRenderPassBeginInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
         renderPassInfo.renderPass = renderPass;
+        // 使用参数指定的交换链中的一个Frame Buffer(这个应该是fragment shader要写入的buffer)
         renderPassInfo.framebuffer = swapChainFramebuffers[imageIndex];
+        // 这个render area定义了shader将要加载和存储的位置(没看懂)
+        renderPassInfo.renderArea.offset = { 0, 0 };
+        // 一般来说大小(extend)是和framebuffer的attachment一致的，如果小了会浪费，大了超出去的部分是一些未定义数值
+        renderPassInfo.renderArea.extent = swapChainExtent;
+        // 给VK_ATTACHMENT_LOAD_OP_CLEAR定义具体的clear color
+        VkClearValue clearColor = { {{0.0f, 0.0f, 0.0f, 1.0f}} };
+        renderPassInfo.clearValueCount = 1;
+        renderPassInfo.pClearValues = &clearColor;
+        // 现在可以开始render pass了，所有record commands的接口都是以vkCmd为前缀的
+        // 这些函数返回void，需要等到我们结束command的record后才会返回错误
+        // 这里第三个参数可以是
+        // VK_SUBPASS_CONTENTS_INLINE: The render pass commands will be embedded in the primary command buffer itself and no secondary command buffers will be executed.
+        // VK_SUBPASS_CONTENTS_SECONDARY_COMMAND_BUFFERS: The render pass commands will be executed from secondary command buffers.
+        vkCmdBeginRenderPass(commandBuffer, &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+
+        // 绑定我们之前用于图形渲染的管线
+        vkCmdBindPipeline(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+        // 我们之前在创建Pipeline的时候，把viewport和scissor设置成动态的了，所以需要在这里设置一下
+        VkViewport viewport{};
+        viewport.x = 0.0f;
+        viewport.y = 0.0f;
+        viewport.width = static_cast<float>(swapChainExtent.width);
+        viewport.height = static_cast<float>(swapChainExtent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+        VkRect2D scissor{};
+        scissor.offset = { 0, 0 };
+        scissor.extent = swapChainExtent;
+        vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+
+        // DrawCall指令，后面4个参数分别是
+        // vertexCount: 要绘制的顶点数量
+        // instanceCount : GPU Instance数量，如果不用的话就填1
+        // firstVertex : 在vertex buffer上的偏移量, 定义了gl_VertexIndex的最小值
+        // firstInstance : GPU Instance的偏移量, 定义了gl_InstanceIndex的最小值
+        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+
+        // 结束render pass
+        vkCmdEndRenderPass(commandBuffer);
+
+        // 结束command的创建
+        if (vkEndCommandBuffer(commandBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to record command buffer!");
+        }
+    }
+
+    void createSyncObjects() {
+        // 创建Semaphore的结构体，目前暂时没有任何参数需要设置，Vulkan在未来可能添加
+        VkSemaphoreCreateInfo semaphoreInfo{};
+        semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+
+        // 创建Fence的结构体
+        VkFenceCreateInfo fenceInfo{};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        // 创建时立刻设置为signaled状态(否则第一帧的vkWaitForFences永远等不到结果)
+        fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+
+        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
+            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS ||
+            vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create semaphores!");
+        }
+    }
+
+    void drawFrame() {
+        // 等上一帧绘制完成
+        // 参数2和3传入fense数组，参数4为true表示等待所有fense标记为已完成，false表示有任意一个完成即可，参数5是等待的最大时间(用64位最大无符号int来表示关闭最大等待时间)
+        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+        
+        // 等待上一帧绘制结束后，手动把这些fense设置为unsignaled
+        vkResetFences(device, 1, &inFlightFence);
+
+        // 从交换链中获取一个可用的image，把这个可用的image在VkFrameBuffer里的下标写到imageIndex中，通过这个下标去实际获取image
+        // 第3个参数是等待的最大时间，用用64位最大无符号int来表示关闭这个等待
+        // 第4和5个参数表示需要等待变为signaled状态的Semaphore和Fence
+        uint32_t imageIndex;
+        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+
+        // commandBuffer在每帧用之前先重置一下
+        // 第二个参数填VkCommandBufferResetFlagBits，我们这里不需要设置任何标志，所以填0
+        vkResetCommandBuffer(commandBuffer, 0);
+
+        // 调用我们写的函数来record一个实际绘制图像的commandBuffer
+        recordCommandBuffer(commandBuffer, imageIndex);
+
+        // 配置提交command所需要的信息
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        // 设置需要等待的Semaphore，我们这里只需要等image可用
+        VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
+        submitInfo.waitSemaphoreCount = 1;
+        submitInfo.pWaitSemaphores = waitSemaphores;
+        // 设置在渲染管线的哪个阶段等待Semaphore，这个pWaitDstStageMask是数组，和pWaitSemaphores是一一对应的
+        // 就是说pWaitDstStageMask[i]需要等待pWaitSemaphores[i]
+        // 因为我们等待的是可用的image，而这个image在输出color的时候才会用到，所以这里设置为VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT
+        // 意思是，前面的那些vertex和geometry shader如果GPU有空闲可以先跑着
+        VkPipelineStageFlags waitStages[] = { VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT };
+        submitInfo.pWaitDstStageMask = waitStages;
+        // 设置当前这个VkSubmitInfo是用于哪些command buffer的
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+        // 设置上面那些command buffers执行结束后，哪些Semaphore需要发出信号(就是变成signaled状态)
+        VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+        submitInfo.signalSemaphoreCount = 1;
+        submitInfo.pSignalSemaphores = signalSemaphores;
+
+        // 把VkSubmitInfo数组提交到指定的VkQueue里
+        // 第4个参数表示这次提交的所有command buffers都执行完之后，需要变成signaled状态的VkFence
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+            throw std::runtime_error("failed to submit draw command buffer!");
+        }
+
+
+        // 最后需要把执行结果重新提交到交换链上，才能最终展示到屏幕上
+        VkPresentInfoKHR presentInfo{};
+        presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        // 设置需要等待哪些Semaphore变成signaled状态后，才可以真正执行presentation
+        // 这里我们就设置为上面那些commands执行完后即可
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores = signalSemaphores;
+        // 设置需要把image展示到哪些交换链的哪个image上，交换链和image都是传递的数组
+        // 意思是把image提交到pSwapchains[i][pImageIndices[i]]上，所以这两个数组的长度是一样的，填一个swapchainCount就行
+        // 不过绝大部分情况下，swapchainCount都是1
+        VkSwapchainKHR swapChains[] = { swapChain };
+        presentInfo.swapchainCount = 1;
+        presentInfo.pSwapchains = swapChains;
+        presentInfo.pImageIndices = &imageIndex;
+        // 这是一个可选的参数，如果上面设置了多个交换链，可以用这个参数传入一个VkResult数组来接受每个交换链的presentation执行结果
+        // 我们只有一个交换链的话可以不用这个参数
+        presentInfo.pResults = nullptr;
+        // 最终把image present到交换链上
+        vkQueuePresentKHR(presentQueue, &presentInfo);
     }
 };
 
