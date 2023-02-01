@@ -3,6 +3,7 @@
 #include <set>
 #include <fstream>
 #include <string>
+#include <array>
 using std::string;
 
 std::ofstream ofs;
@@ -52,6 +53,10 @@ using namespace glm;
 
 const int WIDTH = 800;
 const int HEIGHT = 600;
+
+// 在GPU渲染画面的时候，CPU可以处理的帧数
+// 设置为2意思是假如当前这一帧GPU还没渲染完，CPU可以先处理下一帧，而不是非要等GPU把这一帧渲染完
+const int MAX_FRAMES_IN_FLIGHT = 2;
 
 // NDEBUG是C++标准宏定义，代表“不调试”，会根据VS编译时选择的Debug或Release模式来确认是否定义
 #ifdef NDEBUG
@@ -110,6 +115,57 @@ struct SwapChainSupportDetails {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        // 这里填VERTEX或者INSTANCE，我们不用GPU Instance就填VERTEX
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
+        // 我们的顶点有2个数据，所以用一个长度为2的VkVertexInputAttributeDescription数组来描述属性
+        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+
+        // 不是很懂这个binding的含义，好像和Instance有关
+        attributeDescriptions[0].binding = 0;
+        // 这个就直接对应vertex shader里面的layout location
+        attributeDescriptions[0].location = 0;
+        // 数据格式，我们的pos属性是一个2维有符号浮点数，所以就用这个，对应shader里的vec2
+        // 类似的:
+        // float: VK_FORMAT_R32_SFLOAT
+        // vec2: VK_FORMAT_R32G32_SFLOAT
+        // vec3: VK_FORMAT_R32G32B32_SFLOAT
+        // vec4: VK_FORMAT_R32G32B32A32_SFLOAT
+        // ivec2: VK_FORMAT_R32G32_SINT
+        // uvec4: VK_FORMAT_R32G32B32A32_UINT
+        // double: VK_FORMAT_R64_SFLOAT
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        // 当前这个属性的偏移量
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        // 同上
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        return attributeDescriptions;
+    }
+};
+
+const std::vector<Vertex> vertices = {
+    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+};
+
 class HelloTriangleApplication {
 public:
     void run() {
@@ -147,7 +203,11 @@ private:
     // VkCommandPool是用来管理存储command buffer的内存和分配command buffer的
     VkCommandPool commandPool;
     // 从CommandPool里分配的，CommandPool销毁的时候会自动销毁
-    VkCommandBuffer commandBuffer;
+    std::vector<VkCommandBuffer> commandBuffers;
+    // 存放顶点数据的buffer，Vulkan中的buffer是用于存储可由显卡读取的任意数据的内存区域
+    VkBuffer vertexBuffer;
+    // 存放顶点数据的buffer所使用的内存
+    VkDeviceMemory vertexBufferMemory;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
@@ -156,11 +216,15 @@ private:
     VkPipeline graphicsPipeline;
 
     // 已从交换链获取图形并且可以用于渲染的同步信号
-    VkSemaphore imageAvailableSemaphore;
+    std::vector<VkSemaphore> imageAvailableSemaphores;
     // 渲染已完成的同步信号
-    VkSemaphore renderFinishedSemaphore;
+    std::vector<VkSemaphore> renderFinishedSemaphores;
     // 一次只渲染一帧画面的同步信号
-    VkFence inFlightFence;
+    std::vector<VkFence> inFlightFences;
+    // 当前CPU在处理哪一帧(我们允许CPU不等待GPU完成当前这一帧的绘制，先开始绘制下一帧，所以同步用的信号量和command都有多份，需要确认当前用的哪一份)
+    uint32_t currentFrame = 0;
+
+    bool framebufferResized = false;
 
     void initWindow() {
         glfwInit();
@@ -170,6 +234,16 @@ private:
         glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
+        // 调用这个接口传入一个自定义指针给window，方便回调里面获取this
+        glfwSetWindowUserPointer(window, this);
+        // 设置窗口大小变化的回调
+        glfwSetFramebufferSizeCallback(window, framebufferResizeCallback);
+    }
+
+    static void framebufferResizeCallback(GLFWwindow* window, int width, int height) {
+        // 通过刚刚设置的this指针获取到我们的demo实例
+        auto app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        app->framebufferResized = true;
     }
 
     void initVulkan() {
@@ -185,7 +259,8 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
-        createCommandBuffer();
+        createVertexBuffer();
+        createCommandBuffers();
         createSyncObjects();
     }
 
@@ -201,21 +276,33 @@ private:
         vkDeviceWaitIdle(device);
     }
 
-    void cleanup() {
-        vkDestroySemaphore(device, imageAvailableSemaphore, nullptr);
-        vkDestroySemaphore(device, renderFinishedSemaphore, nullptr);
-        vkDestroyFence(device, inFlightFence, nullptr);
-        vkDestroyCommandPool(device, commandPool, nullptr);
-        for (auto framebuffer : swapChainFramebuffers) {
-            vkDestroyFramebuffer(device, framebuffer, nullptr);
+    void cleanupSwapChain() {
+        for (size_t i = 0; i < swapChainFramebuffers.size(); i++) {
+            vkDestroyFramebuffer(device, swapChainFramebuffers[i], nullptr);
         }
-        vkDestroyPipeline(device, graphicsPipeline, nullptr);
-        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
-        vkDestroyRenderPass(device, renderPass, nullptr);
         for (size_t i = 0; i < swapChainImageViews.size(); i++) {
             vkDestroyImageView(device, swapChainImageViews[i], nullptr);
         }
         vkDestroySwapchainKHR(device, swapChain, nullptr);
+    }
+
+    void cleanup() {
+        cleanupSwapChain();
+
+        vkDestroyBuffer(device, vertexBuffer, nullptr);
+        // buffer销毁后，立刻手动释放对应的内存
+        vkFreeMemory(device, vertexBufferMemory, nullptr);
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroySemaphore(device, renderFinishedSemaphores[i], nullptr);
+            vkDestroySemaphore(device, imageAvailableSemaphores[i], nullptr);
+            vkDestroyFence(device, inFlightFences[i], nullptr);
+        }
+        vkDestroyCommandPool(device, commandPool, nullptr);
+
+        vkDestroyPipeline(device, graphicsPipeline, nullptr);
+        vkDestroyPipelineLayout(device, pipelineLayout, nullptr);
+        vkDestroyRenderPass(device, renderPass, nullptr);
+        
         vkDestroyDevice(device, nullptr);
         DestroyDebugUtilsMessengerEXT(instance, debugMessenger, nullptr);
         vkDestroySurfaceKHR(instance, surface, nullptr);
@@ -885,6 +972,7 @@ private:
         // 1，initialLayout和首个使用该attachment的subpass所需layout不一致
         // 2，finalLayout和最后使用该attachment的subpass所需layout不一致
         // 3，两个subpass读取同一个attachement而且所需layout不同，且驱动实现上区分对待两种layout
+        // 可以参考:https://zhuanlan.zhihu.com/p/350483554
 
         // 这里设置依赖关系中，需要等待上一个Subpass具体完成什么步骤
         // 即等待srcStageMask阶段的srcAccessMask操作完成后
@@ -937,12 +1025,14 @@ private:
         // 结构体描述了顶点数据的格式，该结构体数据传递到vertex shader中
         VkPipelineVertexInputStateCreateInfo vertexInputInfo = {};
         vertexInputInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+        auto bindingDescription = Vertex::getBindingDescription();
+        auto attributeDescriptions = Vertex::getAttributeDescriptions();
         // Bindings:根据数据的间隙，确定数据是每个顶点或者是每个instance(instancing)
-        vertexInputInfo.vertexBindingDescriptionCount = 0;
-        vertexInputInfo.pVertexBindingDescriptions = nullptr; // Optional
+        vertexInputInfo.vertexBindingDescriptionCount = 1;
+        vertexInputInfo.pVertexBindingDescriptions = &bindingDescription;
         // Attribute:描述将要进行绑定及加载属性的顶点着色器中的相关属性类型
-        vertexInputInfo.vertexAttributeDescriptionCount = 0;
-        vertexInputInfo.pVertexAttributeDescriptions = nullptr; // Optional
+        vertexInputInfo.vertexAttributeDescriptionCount = static_cast<uint32_t>(attributeDescriptions.size());
+        vertexInputInfo.pVertexAttributeDescriptions = attributeDescriptions.data();
 
         // 这个结构体描述两件事情:顶点数据以什么类型的几何图元拓扑进行绘制及是否启用顶点索重新开始图元
         VkPipelineInputAssemblyStateCreateInfo inputAssembly = {};
@@ -1171,7 +1261,84 @@ private:
         }
     }
 
-    void createCommandBuffer() {
+    void createVertexBuffer() {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        // 手动计算一下我们这个顶点数组的内存占用大小
+        bufferInfo.size = sizeof(vertices[0]) * vertices.size();
+        // 说明用途，用于存储顶点数据
+        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        // 明确这个buffer是只给一个单独的队列簇使用还是多个队列簇之间会共享
+        // 这个vertex buffer只会用于graphicsQueue，所以设置为EXCLUSIVE
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // 用于配置sparse内存，暂时不用
+        bufferInfo.flags = 0;
+
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create vertex buffer!");
+        }
+
+        // 查询这个buffer所需要的内存信息，这个内存信息包含3个数据
+        // size: 用bytes表示的所需内存大小, 可能和我们前面设置的bufferInfo.size不一致
+        // alignment: The offset in bytes where the buffer begins in the allocated region of memory, depends on bufferInfo.usageand bufferInfo.flags.
+        // memoryTypeBits : 适合这个buffer的内存类型(以bits形式表达)
+        VkMemoryRequirements memRequirements;
+        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+
+        // 申请内存所需的信息
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        // 申请的内存大小
+        allocInfo.allocationSize = memRequirements.size;
+        // 输入我们查找到的符合要求的内存Type索引
+        // 我们填入的VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT是一个固定组合
+        // 应该就是指CPU可以访问，并且解决后面真正用memcpy拷贝数据的时候，可能会遇到的一些问题，具体看后面
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        // 申请内存，放到vertexBufferMemory变量
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate vertex buffer memory!");
+        }
+
+        // 把vertexBuffer和给它申请的内存绑定起来
+        // 第四个参数是内存上的偏移量，因为我们这个内存是专门为这个vertex buffer分配的，所以是0
+        // 如果偏移量不是0，则需要是memRequirements.alignment的倍数
+        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+
+        // 现在需要把顶点数据填入我们刚刚申请的内存里
+        // 新建一个临时指针来获取我们的buffer内存地址
+        void* data;
+        // 把vertexBufferMemory的地址映射到这个临时指针上，倒数第二个参数当前Vulkan版本还没做实现，先固定填0
+        vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
+        // 拷贝我们的顶点数据到指定地址上
+        // 这里Vulkan可能不会立即将数据复制到buffer对应的内存中，比如因为cache的问题，或者也有可能是因为对buffer的写入对mapped memory不可见
+        // 上面查询符合条件的内存时，填的VK_MEMORY_PROPERTY_HOST_COHERENT_BIT就是解决这些问题的
+        // 但是实际上还有性能更好但是更麻烦的解决方案，见:https://vulkan-tutorial.com/en/Vertex_buffers/Vertex_buffer_creation
+        memcpy(data, vertices.data(), (size_t)bufferInfo.size);
+        // 解除映射
+        vkUnmapMemory(device, vertexBufferMemory);
+        // 到这里我们的操作就结束了，Vulkan也清楚了我们做的数据写入，但是实际上由于Vulkan的异步设计，此时数据不会立刻传给GPU
+        // 不过我们不用关心这里面的细节，Vulkan会保证在我们下次调用vkQueueSubmit之前(也就是实际提交渲染命令之前)GPU是可以正确获取这些数据的
+    }
+
+    uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+        // 先查询当前硬件支持的内存属性
+        VkPhysicalDeviceMemoryProperties memProperties;
+        vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
+
+        // 查找符合条件的内存Type索引
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
+                return i;
+            }
+        }
+
+        // 找不到的话抛出异常
+        throw std::runtime_error("failed to find suitable memory type!");
+    }
+
+    void createCommandBuffers() {
+        commandBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocInfo.commandPool = commandPool;
@@ -1180,9 +1347,9 @@ private:
         // 如果有一些Command Buffer是差不多的，可以通过SECONDARY来实现一些通用的操作
         allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         // 我们这里只申请一个command buffer
-        allocInfo.commandBufferCount = 1;
+        allocInfo.commandBufferCount = (uint32_t)commandBuffers.size();
 
-        if (vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer) != VK_SUCCESS) {
+        if (vkAllocateCommandBuffers(device, &allocInfo, commandBuffers.data()) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate command buffers!");
         }
     }
@@ -1247,12 +1414,19 @@ private:
         scissor.extent = swapChainExtent;
         vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 
+        VkBuffer vertexBuffers[] = { vertexBuffer };
+        VkDeviceSize offsets[] = { 0 };
+        // 绑定顶点buffer，第23个参数指定了我们要指定的vertex buffer的binding的偏移量和数量
+        // 第4个参数指定了我们要绑定的vertex buffer数组
+        // 第5个参数指定了要读取对应的vertex buffer数据时，以byte为单位的偏移量
+        vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+
         // DrawCall指令，后面4个参数分别是
         // vertexCount: 要绘制的顶点数量
         // instanceCount : GPU Instance数量，如果不用的话就填1
         // firstVertex : 在vertex buffer上的偏移量, 定义了gl_VertexIndex的最小值
         // firstInstance : GPU Instance的偏移量, 定义了gl_InstanceIndex的最小值
-        vkCmdDraw(commandBuffer, 3, 1, 0, 0);
+        vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
 
         // 结束render pass
         vkCmdEndRenderPass(commandBuffer);
@@ -1264,6 +1438,10 @@ private:
     }
 
     void createSyncObjects() {
+        imageAvailableSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        renderFinishedSemaphores.resize(MAX_FRAMES_IN_FLIGHT);
+        inFlightFences.resize(MAX_FRAMES_IN_FLIGHT);
+
         // 创建Semaphore的结构体，目前暂时没有任何参数需要设置，Vulkan在未来可能添加
         VkSemaphoreCreateInfo semaphoreInfo{};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
@@ -1274,39 +1452,50 @@ private:
         // 创建时立刻设置为signaled状态(否则第一帧的vkWaitForFences永远等不到结果)
         fenceInfo.flags = VK_FENCE_CREATE_SIGNALED_BIT;
 
-        if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphore) != VK_SUCCESS ||
-            vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphore) != VK_SUCCESS ||
-            vkCreateFence(device, &fenceInfo, nullptr, &inFlightFence) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create semaphores!");
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            if (vkCreateSemaphore(device, &semaphoreInfo, nullptr, &imageAvailableSemaphores[i]) != VK_SUCCESS ||
+                vkCreateSemaphore(device, &semaphoreInfo, nullptr, &renderFinishedSemaphores[i]) != VK_SUCCESS ||
+                vkCreateFence(device, &fenceInfo, nullptr, &inFlightFences[i]) != VK_SUCCESS) {
+                throw std::runtime_error("failed to create synchronization objects for a frame!");
+            }
         }
     }
 
     void drawFrame() {
         // 等上一帧绘制完成
         // 参数2和3传入fense数组，参数4为true表示等待所有fense标记为已完成，false表示有任意一个完成即可，参数5是等待的最大时间(用64位最大无符号int来表示关闭最大等待时间)
-        vkWaitForFences(device, 1, &inFlightFence, VK_TRUE, UINT64_MAX);
+        vkWaitForFences(device, 1, &inFlightFences[currentFrame], VK_TRUE, UINT64_MAX);
         
-        // 等待上一帧绘制结束后，手动把这些fense设置为unsignaled
-        vkResetFences(device, 1, &inFlightFence);
-
         // 从交换链中获取一个可用的image，把这个可用的image在VkFrameBuffer里的下标写到imageIndex中，通过这个下标去实际获取image
         // 第3个参数是等待的最大时间，用用64位最大无符号int来表示关闭这个等待
         // 第4和5个参数表示需要等待变为signaled状态的Semaphore和Fence
         uint32_t imageIndex;
-        vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphore, VK_NULL_HANDLE, &imageIndex);
+        VkResult result = vkAcquireNextImageKHR(device, swapChain, UINT64_MAX, imageAvailableSemaphores[currentFrame], VK_NULL_HANDLE, &imageIndex);
+        // 这个结果表示交换链和Surface已经不兼容了，不能继续用了，一般是窗口大小变化导致的
+        if (result == VK_ERROR_OUT_OF_DATE_KHR) {
+            // 这个时候需要重新创建交换链来适配新的Surface
+            recreateSwapChain();
+            return;
+        }
+        else if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR) {
+            throw std::runtime_error("failed to acquire swap chain image!");
+        }
+
+        // 等待上一帧绘制结束，并且确认我们要进行下一帧的绘制后，手动把这些fense设置为unsignaled
+        vkResetFences(device, 1, &inFlightFences[currentFrame]);
 
         // commandBuffer在每帧用之前先重置一下
         // 第二个参数填VkCommandBufferResetFlagBits，我们这里不需要设置任何标志，所以填0
-        vkResetCommandBuffer(commandBuffer, 0);
+        vkResetCommandBuffer(commandBuffers[currentFrame], 0);
 
         // 调用我们写的函数来record一个实际绘制图像的commandBuffer
-        recordCommandBuffer(commandBuffer, imageIndex);
+        recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
 
         // 配置提交command所需要的信息
         VkSubmitInfo submitInfo{};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         // 设置需要等待的Semaphore，我们这里只需要等image可用
-        VkSemaphore waitSemaphores[] = { imageAvailableSemaphore };
+        VkSemaphore waitSemaphores[] = { imageAvailableSemaphores[currentFrame] };
         submitInfo.waitSemaphoreCount = 1;
         submitInfo.pWaitSemaphores = waitSemaphores;
         // 设置在渲染管线的哪个阶段等待Semaphore，这个pWaitDstStageMask是数组，和pWaitSemaphores是一一对应的
@@ -1317,15 +1506,15 @@ private:
         submitInfo.pWaitDstStageMask = waitStages;
         // 设置当前这个VkSubmitInfo是用于哪些command buffer的
         submitInfo.commandBufferCount = 1;
-        submitInfo.pCommandBuffers = &commandBuffer;
+        submitInfo.pCommandBuffers = &commandBuffers[currentFrame];
         // 设置上面那些command buffers执行结束后，哪些Semaphore需要发出信号(就是变成signaled状态)
-        VkSemaphore signalSemaphores[] = { renderFinishedSemaphore };
+        VkSemaphore signalSemaphores[] = { renderFinishedSemaphores[currentFrame] };
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = signalSemaphores;
 
         // 把VkSubmitInfo数组提交到指定的VkQueue里
         // 第4个参数表示这次提交的所有command buffers都执行完之后，需要变成signaled状态的VkFence
-        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFence) != VK_SUCCESS) {
+        if (vkQueueSubmit(graphicsQueue, 1, &submitInfo, inFlightFences[currentFrame]) != VK_SUCCESS) {
             throw std::runtime_error("failed to submit draw command buffer!");
         }
 
@@ -1348,7 +1537,42 @@ private:
         // 我们只有一个交换链的话可以不用这个参数
         presentInfo.pResults = nullptr;
         // 最终把image present到交换链上
-        vkQueuePresentKHR(presentQueue, &presentInfo);
+        result = vkQueuePresentKHR(presentQueue, &presentInfo);
+        // VK_ERROR_OUT_OF_DATE_KHR表示交换链和Surface已经不兼容了，不能继续用了，必须重新创建交换链
+        // VK_SUBOPTIMAL_KHR表示交换链还是可以继续用，但是和Surface的某些属性匹配得不是很好，不重新创建也行
+        if (result == VK_ERROR_OUT_OF_DATE_KHR || result == VK_SUBOPTIMAL_KHR || framebufferResized) {
+            framebufferResized = false;
+            recreateSwapChain();
+        }
+        else if (result != VK_SUCCESS) {
+            throw std::runtime_error("failed to present swap chain image!");
+        }
+
+        // CPU提前进入下一帧
+        currentFrame = (currentFrame + 1) % MAX_FRAMES_IN_FLIGHT;
+    }
+
+    void recreateSwapChain() {
+        int width = 0, height = 0;
+        // 获取一下当前的窗口大小
+        glfwGetFramebufferSize(window, &width, &height);
+        // 如果窗口大小为0(被最小化了)，那么程序就在这里等待，直到窗口重新弹出
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(window, &width, &height);
+            glfwWaitEvents();
+        }
+
+        // 先等逻辑设备执行完当前的命令，不再占用资源
+        vkDeviceWaitIdle(device);
+
+        // 先直接清理掉原来的交换链相关资源
+        cleanupSwapChain();
+
+        // 重新调用创建交换链的接口
+        createSwapChain();
+        // ImageView和FrameBuffer是依赖交换链的Image的，所以也需要重新创建一下
+        createImageViews();
+        createFramebuffers();
     }
 };
 
