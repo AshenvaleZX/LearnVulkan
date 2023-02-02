@@ -4,6 +4,7 @@
 #include <fstream>
 #include <string>
 #include <array>
+#include <chrono>
 using std::string;
 
 std::ofstream ofs;
@@ -48,6 +49,7 @@ static std::vector<char> readFile(const std::string& filename) {
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
 
 using namespace glm;
 
@@ -115,6 +117,16 @@ struct SwapChainSupportDetails {
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+struct UniformBufferObject {
+    // 这个struct是要放到uniform buffer传给shader用的，这里就涉及一个C++变量和shader变量在内存上对齐的问题
+    // Vulkan的具体要求见:https://www.khronos.org/registry/vulkan/specs/1.3-extensions/html/chap15.html#interfaces-resources-layout
+    // 所以为了不出现奇怪我问题，这种uniform数据我们最好都用alignas显示声明一下对齐的格式
+    // 以16字节对齐应该能保证不出问题(不过我们这里的数据刚好是16字节的倍数，不显示声明也行，但是最好养成习惯)
+    alignas(16) glm::mat4 model;
+    alignas(16) glm::mat4 view;
+    alignas(16) glm::mat4 proj;
+};
+
 struct Vertex {
     glm::vec2 pos;
     glm::vec3 color;
@@ -161,9 +173,14 @@ struct Vertex {
 };
 
 const std::vector<Vertex> vertices = {
-    {{0.0f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{-0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}}
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
+    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
+    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
+    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+};
+
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0
 };
 
 class HelloTriangleApplication {
@@ -208,12 +225,27 @@ private:
     VkBuffer vertexBuffer;
     // 存放顶点数据的buffer所使用的内存
     VkDeviceMemory vertexBufferMemory;
+    // 存放顶点索引的buffer
+    // 实际上这个buffer和上面的vertexBuffer可以合并到一起，在使用的时候Vulkan接口里会有一个offset参数来指定这一段数据应该从哪开始读
+    // 甚至可以几个完全不同的资源使用同一个VkBuffer，只要你能保证这几个资源不会在一个操作中同时使用，在需要用的时候更新VkBuffer就行
+    VkBuffer indexBuffer;
+    VkDeviceMemory indexBufferMemory;
+    // 给shader传uniform数据的buffer，因为我们可能会同时绘制多帧，所以这些数据都是长度为MAX_FRAMES_IN_FLIGHT的vector
+    std::vector<VkBuffer> uniformBuffers;
+    std::vector<VkDeviceMemory> uniformBuffersMemory;
+    std::vector<void*> uniformBuffersMapped;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
     VkPipelineLayout pipelineLayout;
     // 用于渲染图形的管线(做游戏基本上都是图形管线，不过Vulkan是设计成可以完成其他各种需要GPU的工作的)
     VkPipeline graphicsPipeline;
+    // 用于描述给shader传MVP矩阵之类的数据的描述符结构
+    VkDescriptorSetLayout descriptorSetLayout;
+    // 用于实际分配描述符的pool
+    VkDescriptorPool descriptorPool;
+    // 实际分配出来的描述符集，是数组，和uniform buffer数组对应
+    std::vector<VkDescriptorSet> descriptorSets;
 
     // 已从交换链获取图形并且可以用于渲染的同步信号
     std::vector<VkSemaphore> imageAvailableSemaphores;
@@ -231,7 +263,6 @@ private:
 
         // 最初GLFW是为OpenGL创建上下文，所以在这里我们需要告诉它不要调用OpenGL相关的初始化操作
         glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-        glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
         window = glfwCreateWindow(WIDTH, HEIGHT, "Vulkan", nullptr, nullptr);
         // 调用这个接口传入一个自定义指针给window，方便回调里面获取this
@@ -256,10 +287,16 @@ private:
         createSwapChain();
         createImageViews();
         createRenderPass();
+        // 创建用于描述uniforms的结构体
+        createDescriptorSetLayout();
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
         createVertexBuffer();
+        createIndexBuffer();
+        createUniformBuffers();
+        createDescriptorPool();
+        createDescriptorSets();
         createCommandBuffers();
         createSyncObjects();
     }
@@ -288,6 +325,17 @@ private:
 
     void cleanup() {
         cleanupSwapChain();
+
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            vkDestroyBuffer(device, uniformBuffers[i], nullptr);
+            vkFreeMemory(device, uniformBuffersMemory[i], nullptr);
+        }
+
+        vkDestroyDescriptorPool(device, descriptorPool, nullptr);
+        vkDestroyDescriptorSetLayout(device, descriptorSetLayout, nullptr);
+
+        vkDestroyBuffer(device, indexBuffer, nullptr);
+        vkFreeMemory(device, indexBufferMemory, nullptr);
 
         vkDestroyBuffer(device, vertexBuffer, nullptr);
         // buffer销毁后，立刻手动释放对应的内存
@@ -994,6 +1042,111 @@ private:
         }
     }
 
+    void createDescriptorSetLayout() {
+        VkDescriptorSetLayoutBinding uboLayoutBinding{};
+        // 这个对应shader代码里面的layout(binding = 0)
+        uboLayoutBinding.binding = 0;
+        // shader的uniform数据就用这个type
+        uboLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        // 可以传入uniform数组，这个是数组长度
+        // 例如，这可用于为骨骼动画的骨架中的每个骨骼指定一个trasform
+        uboLayoutBinding.descriptorCount = 1;
+        // 我们这个数据只用于vertex shader
+        uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        // 用于贴图的，暂时用不着
+        uboLayoutBinding.pImmutableSamplers = nullptr; // Optional
+
+
+        // 创建用于描述shader uniform变量的数据结构信息
+        VkDescriptorSetLayoutCreateInfo layoutInfo{};
+        layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+        // 只需要填入VkDescriptorSetLayoutBinding数组就行，一个VkDescriptorSetLayoutBinding就对应一个uniform
+        layoutInfo.bindingCount = 1;
+        layoutInfo.pBindings = &uboLayoutBinding;
+
+        // 把创建出来的数据结构存放到descriptorSetLayout中
+        if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor set layout!");
+        }
+    }
+
+    void createDescriptorPool() {
+        // 先确定我们需要的描述符类型和数量
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        // 因为我们是给uniform buffer用的，所以数量和uniform buffer数量一致
+        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+
+        VkDescriptorPoolCreateInfo poolInfo{};
+        poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+        poolInfo.poolSizeCount = 1;
+        poolInfo.pPoolSizes = &poolSize;
+        // 设置可能分配的descriptor sets的最大数量
+        poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // 可以设置为VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT来表示可以释放单个描述符集(descriptor set)
+        // 不过暂时不用
+        poolInfo.flags = 0;
+
+        if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create descriptor pool!");
+        }
+    }
+
+    void createDescriptorSets() {
+        // 因为我们有多个uniform buffer，并且Vulkan接口需要长度匹配的数据，所以把描述符layout数据弄成长度一样的数组，即使数据是一样的
+        std::vector<VkDescriptorSetLayout> layouts(MAX_FRAMES_IN_FLIGHT, descriptorSetLayout);
+        // 分配描述符集的信息
+        VkDescriptorSetAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        // 从哪个pool分配
+        allocInfo.descriptorPool = descriptorPool;
+        // 具体要分配什么样的描述符，以数组形式传入
+        allocInfo.descriptorSetCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        allocInfo.pSetLayouts = layouts.data();
+
+        // 设置一下vector长度
+        descriptorSets.resize(MAX_FRAMES_IN_FLIGHT);
+        // 调用接口实际分配描述符集
+        if (vkAllocateDescriptorSets(device, &allocInfo, descriptorSets.data()) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate descriptor sets!");
+        }
+
+        // 实际填充描述符数据
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            // 我们用于描述buffer的描述符用这个结构体填充信息
+            VkDescriptorBufferInfo bufferInfo{};
+            bufferInfo.buffer = uniformBuffers[i];
+            bufferInfo.offset = 0;
+            // 如果我们需要更新整个buffer的数据，也可以直接用VK_WHOLE_SIZE来表示整个buffer的大小
+            bufferInfo.range = sizeof(UniformBufferObject);
+
+            // 更新描述符集需要用的结构体，是实际更新描述符的接口vkUpdateDescriptorSets的参数
+            VkWriteDescriptorSet descriptorWrite{};
+            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            // 我们要更新的描述符集
+            descriptorWrite.dstSet = descriptorSets[i];
+            // 不懂这个参数的含义
+            descriptorWrite.dstBinding = 0;
+            // 描述符集是描述符的数组，这个指定我们这次要从第几个描述符开始更新
+            descriptorWrite.dstArrayElement = 0;
+            // 我们要更新多少个描述符
+            descriptorWrite.descriptorCount = 1;
+            // 我们要更新的描述符类型
+            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            // 后面3个参数都是长度为descriptorCount的数组
+            // 描述符具体是描述什么类型数据的，就填充哪一个参数
+            // 我们要更新的这个描述符所描述的buffer的信息
+            descriptorWrite.pBufferInfo = &bufferInfo;
+            // 描述image用的
+            descriptorWrite.pImageInfo = nullptr; // Optional
+            // 描述这个我也不知道是什么东西用的
+            descriptorWrite.pTexelBufferView = nullptr; // Optional
+
+            // 更新描述符集，这个接口接收两个数组，第一个数组是我们要更新的描述符集数组，第二个数组是用于复制描述符集数据的数组
+            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+        }
+    }
+
     void createGraphicsPipeline() {
         auto vertShaderCode = readFile("../../Shader/triangle.vert.spv");
         auto fragShaderCode = readFile("../../Shader/triangle.frag.spv");
@@ -1102,7 +1255,10 @@ private:
         // 这个就是FaceCull，这里用背面裁剪
         rasterizer.cullMode = VK_CULL_MODE_BACK_BIT;
         // 设置怎么判断正面
-        rasterizer.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        // 本来我们的顶点顺序应该是顺时针为正面，但是因为我们用的GLM构建透视投影矩阵，而GLM是给OpenGL设计的，裁剪空间的Y轴和Vulkan是反的
+        // 所以画面渲染出来是上下颠倒的，我们就把透视投影矩阵的Y轴取反了一下，把画面转回来
+        // 但是这会导致顶点的顺逆时针方向也反了，所以虽然我们的顶点顺序原本是顺时针为正面，但是这里要设置成逆时针
+        rasterizer.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         // 这些设置一般是渲染阴影贴图用的，暂时用不到
         rasterizer.depthBiasEnable = VK_FALSE;
         rasterizer.depthBiasConstantFactor = 0.0f; // Optional
@@ -1127,7 +1283,7 @@ private:
         colorBlendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         colorBlendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
         colorBlendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-        // 这个也是设置色彩回合的一种方式，并且是一个全局的设置，如果这个开了，上面的那个设置就会失效，相当于上面的blendEnable = VK_FALSE
+        // 这个也是设置色彩混合的一种方式，并且是一个全局的设置，如果这个开了，上面的那个设置就会失效，相当于上面的blendEnable = VK_FALSE
         // 这个还不是很懂，先不用这个
         VkPipelineColorBlendStateCreateInfo colorBlending{};
         colorBlending.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -1140,11 +1296,13 @@ private:
         colorBlending.blendConstants[2] = 0.0f; // Optional
         colorBlending.blendConstants[3] = 0.0f; // Optional
 
-        // shader开头写的那个layout，这里暂时不设置
+        // shader开头写的那个layout
         VkPipelineLayoutCreateInfo pipelineLayoutInfo{};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-        pipelineLayoutInfo.setLayoutCount = 0; // Optional
-        pipelineLayoutInfo.pSetLayouts = nullptr; // Optional
+        // shader里的uniform信息
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+        // 
         pipelineLayoutInfo.pushConstantRangeCount = 0; // Optional
         pipelineLayoutInfo.pPushConstantRanges = nullptr; // Optional
         // 创建PipelineLayout，并保存到成员变量，后续会用
@@ -1262,19 +1420,107 @@ private:
     }
 
     void createVertexBuffer() {
+        VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
+
+        // 新建一个临时的buffer给CPU写入数据
+        // 因为Vulkan的buffer内存管理做的比较细致，是区分了CPU是否可以访问的，有些buffer的数据，一旦创建了就只会被GPU访问，CPU这边不再需要访问
+        // 这种数据就可以明确创建一个CPU不能直接访问的buffer来存放，内存性能是更好的
+        // 但是这种buffer的数据肯定还是需要CPU提供，所以我们需要创建另一个CPU可以访问的buffer，命名为stagingBuffer，在CPU把数据写入stagingBuffer
+        // 然后再新建另一个vertexBuffer作为真正存放数据的buffer，通过一个command，让GPU那边把数据从stagingBuffer复制到vertexBuffer里
+        // 这样真正的vertexBuffer就不需要被CPU访问，Vulkan会对它做内存优化
+        // stagingBuffer需要设置为VK_BUFFER_USAGE_TRANSFER_SRC_BIT，表示为可以用作内存transfer操作的源buffer
+        // vertexBuffer作为接受数据的一方，需要设置为VK_BUFFER_USAGE_TRANSFER_DST_BIT，表示可以用作内存transfer操作的目标buffer
+        // 并且还需要同时设置为VK_BUFFER_USAGE_VERTEX_BUFFER_BIT表示是用作存放顶点数据的
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        // 我们填入的VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT是一个固定组合
+        // 就是指CPU可以访问，并且解决后面真正用memcpy拷贝数据的时候，可能会遇到的一些问题，具体看后面
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        // 现在需要把顶点数据填入我们刚刚申请的内存里
+        // 新建一个临时指针来获取我们的buffer内存地址
+        void* data;
+        // 把stagingBufferMemory的地址映射到这个临时指针上，倒数第二个参数当前Vulkan版本还没做实现，先固定填0
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        // 拷贝我们的顶点数据到指定地址上
+        // 这里Vulkan可能不会立即将数据复制到buffer对应的内存中，比如因为cache的问题，或者也有可能是因为对buffer的写入对mapped memory不可见
+        // 上面查询符合条件的内存时，填的VK_MEMORY_PROPERTY_HOST_COHERENT_BIT就是解决这些问题的
+        // 但是实际上还有性能更好但是更麻烦的解决方案，见:https://vulkan-tutorial.com/en/Vertex_buffers/Vertex_buffer_creation
+        memcpy(data, vertices.data(), (size_t)bufferSize);
+        // 解除映射
+        vkUnmapMemory(device, stagingBufferMemory);
+        // 到这里Vulkan就清楚了我们做的数据写入，但是实际上由于Vulkan的异步设计，此时数据不会立刻传给GPU
+        // 不过我们不用关心这里面的细节，Vulkan会保证在我们下次调用vkQueueSubmit之前(也就是实际提交渲染命令之前)GPU是可以正确获取这些数据的
+
+        // 创建真正用于存放顶点数据的buffer，VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT上面已经解释过了
+        // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT的意思是这个buffer的内存只对GPU可见，CPU不可直接访问
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, vertexBuffer, vertexBufferMemory);
+
+        // 调用自己实现的函数拷贝buffer数据
+        copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
+
+        // 临时buffer用完后立刻销毁并释放内存
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void createIndexBuffer() {
+        // 这个函数和createVertexBuffer几乎是一样的，就不逐行注释了
+        VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
+
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, bufferSize, 0, &data);
+        memcpy(data, indices.data(), (size_t)bufferSize);
+        vkUnmapMemory(device, stagingBufferMemory);
+
+        // 这里用VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+        createBuffer(bufferSize, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, indexBuffer, indexBufferMemory);
+
+        copyBuffer(stagingBuffer, indexBuffer, bufferSize);
+
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
+    }
+
+    void createUniformBuffers() {
+        VkDeviceSize bufferSize = sizeof(UniformBufferObject);
+
+        uniformBuffers.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMemory.resize(MAX_FRAMES_IN_FLIGHT);
+        uniformBuffersMapped.resize(MAX_FRAMES_IN_FLIGHT);
+
+        // 这些用于传递uniform数据的buffer，因为每一帧都会重新写入，直接设置为CPU可见的模式就行
+        // 所以也没必要搞stagingBuffer来transfer数据了
+        for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
+            createBuffer(bufferSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, uniformBuffers[i], uniformBuffersMemory[i]);
+
+            // 这里把内存映射到指针数组uniformBuffersMapped里面之后就行了
+            // 不用立刻填入数据，因为会在每一帧渲染的时候再去填数据
+            // 而且也不需要vkUnmapMemory，因为我们每一帧都需要用这个指针去填数据，如果现在Unmap了，那每一帧还得重新map
+            // 这个叫做persistent mapping
+            // 这个映射应该和uniformBuffers变量的生命周期一致
+            vkMapMemory(device, uniformBuffersMemory[i], 0, bufferSize, 0, &uniformBuffersMapped[i]);
+        }
+    }
+
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, VkBuffer& buffer, VkDeviceMemory& bufferMemory) {
         VkBufferCreateInfo bufferInfo{};
         bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        // 手动计算一下我们这个顶点数组的内存占用大小
-        bufferInfo.size = sizeof(vertices[0]) * vertices.size();
-        // 说明用途，用于存储顶点数据
-        bufferInfo.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT;
+        // buffer的内存占用大小
+        bufferInfo.size = size;
+        // 说明buffer的用途
+        bufferInfo.usage = usage;
         // 明确这个buffer是只给一个单独的队列簇使用还是多个队列簇之间会共享
-        // 这个vertex buffer只会用于graphicsQueue，所以设置为EXCLUSIVE
+        // VK_SHARING_MODE_EXCLUSIVE就是只有一个队列簇使用它
         bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         // 用于配置sparse内存，暂时不用
         bufferInfo.flags = 0;
 
-        if (vkCreateBuffer(device, &bufferInfo, nullptr, &vertexBuffer) != VK_SUCCESS) {
+        if (vkCreateBuffer(device, &bufferInfo, nullptr, &buffer) != VK_SUCCESS) {
             throw std::runtime_error("failed to create vertex buffer!");
         }
 
@@ -1283,7 +1529,7 @@ private:
         // alignment: The offset in bytes where the buffer begins in the allocated region of memory, depends on bufferInfo.usageand bufferInfo.flags.
         // memoryTypeBits : 适合这个buffer的内存类型(以bits形式表达)
         VkMemoryRequirements memRequirements;
-        vkGetBufferMemoryRequirements(device, vertexBuffer, &memRequirements);
+        vkGetBufferMemoryRequirements(device, buffer, &memRequirements);
 
         // 申请内存所需的信息
         VkMemoryAllocateInfo allocInfo{};
@@ -1291,33 +1537,73 @@ private:
         // 申请的内存大小
         allocInfo.allocationSize = memRequirements.size;
         // 输入我们查找到的符合要求的内存Type索引
-        // 我们填入的VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT是一个固定组合
-        // 应该就是指CPU可以访问，并且解决后面真正用memcpy拷贝数据的时候，可能会遇到的一些问题，具体看后面
-        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-        // 申请内存，放到vertexBufferMemory变量
-        if (vkAllocateMemory(device, &allocInfo, nullptr, &vertexBufferMemory) != VK_SUCCESS) {
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+        // 申请内存，放到bufferMemory变量，用这个函数申请的内存需要手动用vkFreeMemory
+        // 注意这个vkAllocateMemory函数其实是不推荐使用的，可能是因为有点浪费内存吧，反正用这个接口申请的内存数量，不能同时存在超过maxMemoryAllocationCount个
+        // 即使在GTX 1080这种比较高端的显卡上，这个数量也只有4096
+        // 所以实际上真正的Vulkan应用，需要自己实现allocator，不过也有开源的库:https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &bufferMemory) != VK_SUCCESS) {
             throw std::runtime_error("failed to allocate vertex buffer memory!");
         }
 
-        // 把vertexBuffer和给它申请的内存绑定起来
-        // 第四个参数是内存上的偏移量，因为我们这个内存是专门为这个vertex buffer分配的，所以是0
+        // 把buffer和给它申请的内存绑定起来
+        // 第四个参数是内存上的偏移量，没有就是0
         // 如果偏移量不是0，则需要是memRequirements.alignment的倍数
-        vkBindBufferMemory(device, vertexBuffer, vertexBufferMemory, 0);
+        vkBindBufferMemory(device, buffer, bufferMemory, 0);
+    }
 
-        // 现在需要把顶点数据填入我们刚刚申请的内存里
-        // 新建一个临时指针来获取我们的buffer内存地址
-        void* data;
-        // 把vertexBufferMemory的地址映射到这个临时指针上，倒数第二个参数当前Vulkan版本还没做实现，先固定填0
-        vkMapMemory(device, vertexBufferMemory, 0, bufferInfo.size, 0, &data);
-        // 拷贝我们的顶点数据到指定地址上
-        // 这里Vulkan可能不会立即将数据复制到buffer对应的内存中，比如因为cache的问题，或者也有可能是因为对buffer的写入对mapped memory不可见
-        // 上面查询符合条件的内存时，填的VK_MEMORY_PROPERTY_HOST_COHERENT_BIT就是解决这些问题的
-        // 但是实际上还有性能更好但是更麻烦的解决方案，见:https://vulkan-tutorial.com/en/Vertex_buffers/Vertex_buffer_creation
-        memcpy(data, vertices.data(), (size_t)bufferInfo.size);
-        // 解除映射
-        vkUnmapMemory(device, vertexBufferMemory);
-        // 到这里我们的操作就结束了，Vulkan也清楚了我们做的数据写入，但是实际上由于Vulkan的异步设计，此时数据不会立刻传给GPU
-        // 不过我们不用关心这里面的细节，Vulkan会保证在我们下次调用vkQueueSubmit之前(也就是实际提交渲染命令之前)GPU是可以正确获取这些数据的
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        // 需要创建一个临时的command来做完成buffer的复制
+        VkCommandBufferAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        // 这种临时command，可以专门建一个属性更合适的commandPool来管理，不过直接用这个pool也行
+        allocInfo.commandPool = commandPool;
+        allocInfo.commandBufferCount = 1;
+
+        // 创建这个临时command buffer
+        VkCommandBuffer commandBuffer;
+        vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+        // 直接开始record command
+        VkCommandBufferBeginInfo beginInfo{};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        // 明确设置为一次性的command
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        // 告诉Vulkan开始record
+        vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+        // 准备CopyBuffer指令所需要的信息
+        VkBufferCopy copyRegion{};
+        // 偏移量
+        copyRegion.srcOffset = 0; // Optional
+        copyRegion.dstOffset = 0; // Optional
+        // 数据大小
+        copyRegion.size = size;
+        // 记录CopyBuffer指令
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        // 因为只有这一个操作，所以可以直接结束record了
+        vkEndCommandBuffer(commandBuffer);
+
+        // 直接开始准备提交command
+        VkSubmitInfo submitInfo{};
+        submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submitInfo.commandBufferCount = 1;
+        submitInfo.pCommandBuffers = &commandBuffer;
+
+        // 把指令提交到我们的graphicsQueue执行
+        // 这里所提交的VkQueue是需要支持VK_QUEUE_TRANSFER_BIT的，不过我们的graphicsQueue是支持VK_QUEUE_GRAPHICS_BIT的
+        // 如果支持VK_QUEUE_GRAPHICS_BIT的话那也一定支持VK_QUEUE_TRANSFER_BIT，所以直接用graphicsQueue就行
+        vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+        // 记住Vulkan的异步设计，vkQueueSubmit提交完指令后，不会等到GPU执行完就会立刻返回
+        // 我们这里调用vkQueueWaitIdle等GPU执行完command再继续执行后面的代码
+        // 因为我们只有一个指令，所以直接用这种比较笨拙的方式等待，而不是在vkQueueSubmit的最后一个参数传入VkFence
+        // 如果有很多指令，需要手动排序执行，就用那个VkFence的机制而不是这个Wait
+        vkQueueWaitIdle(graphicsQueue);
+
+        // 执行完立刻清理这个一次性command
+        vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
     }
 
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
@@ -1420,13 +1706,31 @@ private:
         // 第4个参数指定了我们要绑定的vertex buffer数组
         // 第5个参数指定了要读取对应的vertex buffer数据时，以byte为单位的偏移量
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
+        // 绑定顶点索引
+        vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+        // 绑定用于描述uniform的描述符集
+        // 参数2是指定我们绑定的是图形管线，因为描述符也可以用于非图形管线
+        // 参数3是指我们绑定的这个管线的layout(创建管线的时候在这个layout里面填入了描述符信息)
+        // 参数4是指把参数6描述符集数组的第几个描述符集当作第一个
+        // 参数5是要绑定多少个描述符集
+        // 参数6是描述符集数组
+        // 参数78是一个偏移量数组，用于动态描述符集的
+        vkCmdBindDescriptorSets(commandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipelineLayout, 0, 1, &descriptorSets[currentFrame], 0, nullptr);
 
         // DrawCall指令，后面4个参数分别是
         // vertexCount: 要绘制的顶点数量
         // instanceCount : GPU Instance数量，如果不用的话就填1
         // firstVertex : 在vertex buffer上的偏移量, 定义了gl_VertexIndex的最小值
         // firstInstance : GPU Instance的偏移量, 定义了gl_InstanceIndex的最小值
-        vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+        // vkCmdDraw(commandBuffer, static_cast<uint32_t>(vertices.size()), 1, 0, 0);
+
+        // IndexedDrawCall指令，后面5个参数分别是
+        // vertexCount: 要绘制的顶点数量
+        // instanceCount : GPU Instance数量，如果不用的话就填1
+        // firstIndex : 第一个顶点的下标，比如填1的话GPU就会从数组中第二个顶点开始读
+        // vertexOffset : 索引偏移量，整个index数组里的数字都会加上这个数值
+        // firstInstance : GPU Instance的偏移量, 定义了gl_InstanceIndex的最小值
+        vkCmdDrawIndexed(commandBuffer, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
 
         // 结束render pass
         vkCmdEndRenderPass(commandBuffer);
@@ -1490,6 +1794,9 @@ private:
 
         // 调用我们写的函数来record一个实际绘制图像的commandBuffer
         recordCommandBuffer(commandBuffers[currentFrame], imageIndex);
+
+        // 每帧更新一下uniform buffer里的数据
+        updateUniformBuffer(currentFrame);
 
         // 配置提交command所需要的信息
         VkSubmitInfo submitInfo{};
@@ -1573,6 +1880,24 @@ private:
         // ImageView和FrameBuffer是依赖交换链的Image的，所以也需要重新创建一下
         createImageViews();
         createFramebuffers();
+    }
+
+    void updateUniformBuffer(uint32_t currentImage) {
+        // 计算一下当前运行的时间
+        static auto startTime = std::chrono::high_resolution_clock::now();
+        auto currentTime = std::chrono::high_resolution_clock::now();
+        float time = std::chrono::duration<float, std::chrono::seconds::period>(currentTime - startTime).count();
+
+        UniformBufferObject ubo{};
+        // 计算MVP矩阵
+        ubo.model = glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.view = glm::lookAt(glm::vec3(2.0f, 2.0f, 2.0f), glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 0.0f, 1.0f));
+        ubo.proj = glm::perspective(glm::radians(45.0f), swapChainExtent.width / (float)swapChainExtent.height, 0.1f, 10.0f);
+        // GLM原本是为OpenGL设计的，Vulkan的裁剪坐标Y轴和OpenGL是反的，所以这里透视投影矩阵的Y轴取反一下
+        ubo.proj[1][1] *= -1;
+
+        // 把数据复制到指向uniform buffer内存地址的指针
+        memcpy(uniformBuffersMapped[currentImage], &ubo, sizeof(ubo));
     }
 };
 
