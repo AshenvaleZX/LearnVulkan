@@ -50,6 +50,8 @@ static std::vector<char> readFile(const std::string& filename) {
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb_image.h>
 
 using namespace glm;
 
@@ -234,6 +236,9 @@ private:
     std::vector<VkBuffer> uniformBuffers;
     std::vector<VkDeviceMemory> uniformBuffersMemory;
     std::vector<void*> uniformBuffersMapped;
+    // 这个VkImage其实和VkBuffer差不多，VkImage只是专门为存储图像做了优化的VkBuffer
+    VkImage textureImage;
+    VkDeviceMemory textureImageMemory;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
@@ -292,6 +297,7 @@ private:
         createGraphicsPipeline();
         createFramebuffers();
         createCommandPool();
+        createTextureImage();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -1419,6 +1425,88 @@ private:
         }
     }
 
+    void createTextureImage() {
+        // 用stb_image库读硬盘上的图片文件
+        int texWidth, texHeight, texChannels;
+        stbi_uc* pixels = stbi_load("../../Textures/awesomeface.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        VkDeviceSize imageSize = texWidth * texHeight * 4;
+        if (!pixels) {
+            throw std::runtime_error("failed to load texture image!");
+        }
+
+        // 新建一个临时的buffer给CPU写入数据，和下面的createVertexBuffer一样
+        VkBuffer stagingBuffer;
+        VkDeviceMemory stagingBufferMemory;
+        createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+        // 把数据拷贝到临时buffer
+        void* data;
+        vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+        memcpy(data, pixels, static_cast<size_t>(imageSize));
+        vkUnmapMemory(device, stagingBufferMemory);
+        // 数据拷贝完就可以释放了
+        stbi_image_free(pixels);
+
+        // usage参数:
+        // 这里我们要从一个stagingBuffer接收数据，所以要写一个VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        // 然后再写一个VK_IMAGE_USAGE_SAMPLED_BIT表示会用于shader代码采样纹理
+        // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT的意思是这个image的内存只对GPU可见，CPU不可直接访问，和申请buffer一样
+        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+    }
+
+    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+        // 创建VkImage的结构体(VkImage其实就是专门为图像存储优化过的VkBuffer)
+        VkImageCreateInfo imageInfo{};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        // 我们创建2D纹理
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        // 高宽
+        imageInfo.extent.width = width;
+        imageInfo.extent.height = height;
+        // depth可以大致理解为垂直轴上的像素数量，如果不是3D纹理应该都是1吧
+        imageInfo.extent.depth = 1;
+        // mipmap层数
+        imageInfo.mipLevels = 1;
+        // 图片数组长度?
+        imageInfo.arrayLayers = 1;
+        // 图片格式，需要和stagingBuffer上的数据格式，也就是stbi_load的格式一致，否则写入数据的时候要出问题
+        imageInfo.format = format;
+        // 可以有2个类型
+        // VK_IMAGE_TILING_LINEAR: texel以行为主序排列为数组
+        // VK_IMAGE_TILING_OPTIMAL: texel按照Vulkan的具体实现来定义的一种顺序排列，以实现最佳访问
+        // 这个和layout不一样，一旦设置之后是固定的不能改，如果CPU需要读取这个数据，就设置为VK_IMAGE_TILING_LINEAR
+        // 如果只是GPU使用，就设置为VK_IMAGE_TILING_OPTIMAL性能更好
+        imageInfo.tiling = tiling;
+        // 这里只能填VK_IMAGE_LAYOUT_UNDEFINED或者VK_IMAGE_LAYOUT_PREINITIALIZED
+        // VK_IMAGE_LAYOUT_UNDEFINED意味着第一次transition数据的时候数据会被丢弃
+        // VK_IMAGE_LAYOUT_PREINITIALIZED是第一次transition数据的时候数据会被保留
+        // 不是很懂这个什么意思，如果是一个用来从CPU写入数据，然后transfer到其它VkImage的stagingImage，就要用VK_IMAGE_LAYOUT_PREINITIALIZED
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        // 这个VkImage的用途，和创建VkBuffer的参数一样
+        imageInfo.usage = usage;
+        // 只在一个队列簇使用，不共享
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        // 这个只影响当作attachments使用的VkImage，所以这里填1_Bit
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        // 可以加一些标志，给特殊用途的图像做优化，比如3D的稀疏(sparse)图像
+        imageInfo.flags = 0; // Optional
+
+        if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image!");
+        }
+
+        // 申请内存并绑定，和createBuffer是一模一样的，这里不逐行注释了
+        VkMemoryRequirements memRequirements;
+        vkGetImageMemoryRequirements(device, image, &memRequirements);
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memRequirements.size;
+        allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+        if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+            throw std::runtime_error("failed to allocate image memory!");
+        }
+        vkBindImageMemory(device, image, imageMemory, 0);
+    }
+
     void createVertexBuffer() {
         VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
 
@@ -1552,7 +1640,7 @@ private:
         vkBindBufferMemory(device, buffer, bufferMemory, 0);
     }
 
-    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+    VkCommandBuffer beginSingleTimeCommands() {
         // 需要创建一个临时的command来做完成buffer的复制
         VkCommandBufferAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1573,17 +1661,11 @@ private:
         // 告诉Vulkan开始record
         vkBeginCommandBuffer(commandBuffer, &beginInfo);
 
-        // 准备CopyBuffer指令所需要的信息
-        VkBufferCopy copyRegion{};
-        // 偏移量
-        copyRegion.srcOffset = 0; // Optional
-        copyRegion.dstOffset = 0; // Optional
-        // 数据大小
-        copyRegion.size = size;
-        // 记录CopyBuffer指令
-        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+        return commandBuffer;
+    }
 
-        // 因为只有这一个操作，所以可以直接结束record了
+    void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
+        // 结束record了
         vkEndCommandBuffer(commandBuffer);
 
         // 直接开始准备提交command
@@ -1604,6 +1686,22 @@ private:
 
         // 执行完立刻清理这个一次性command
         vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+    }
+
+    void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // 准备CopyBuffer指令所需要的信息
+        VkBufferCopy copyRegion{};
+        // 偏移量
+        copyRegion.srcOffset = 0; // Optional
+        copyRegion.dstOffset = 0; // Optional
+        // 数据大小
+        copyRegion.size = size;
+        // 记录CopyBuffer指令
+        vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+        endSingleTimeCommands(commandBuffer);
     }
 
     uint32_t findMemoryType(uint32_t typeFilter, VkMemoryPropertyFlags properties) {
