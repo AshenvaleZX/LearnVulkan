@@ -239,6 +239,8 @@ private:
     // 这个VkImage其实和VkBuffer差不多，VkImage只是专门为存储图像做了优化的VkBuffer
     VkImage textureImage;
     VkDeviceMemory textureImageMemory;
+    // VkImage无法直接访问，需要通过VkImageView间接访问
+    VkImageView textureImageView;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
@@ -290,7 +292,7 @@ private:
         pickPhysicalDevice();
         createLogicalDevice();
         createSwapChain();
-        createImageViews();
+        createSwapChainImageViews();
         createRenderPass();
         // 创建用于描述uniforms的结构体
         createDescriptorSetLayout();
@@ -298,6 +300,7 @@ private:
         createFramebuffers();
         createCommandPool();
         createTextureImage();
+        createTextureImageView();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -331,6 +334,10 @@ private:
 
     void cleanup() {
         cleanupSwapChain();
+
+        vkDestroyImageView(device, textureImageView, nullptr);
+        vkDestroyImage(device, textureImage, nullptr);
+        vkFreeMemory(device, textureImageMemory, nullptr);
 
         for (size_t i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
             vkDestroyBuffer(device, uniformBuffers[i], nullptr);
@@ -873,44 +880,51 @@ private:
         }
     }
 
-    void createImageViews() {
+    void createSwapChainImageViews() {
         // size和swapChainImages一致
         swapChainImageViews.resize(swapChainImages.size());
 
         // 循环遍历swapChainImages来创建swapChainImageViews
         for (size_t i = 0; i < swapChainImages.size(); i++) {
-            VkImageViewCreateInfo createInfo = {};
-            createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-            createInfo.image = swapChainImages[i];
-
-            // 可以是1D，2D，3D或者CubeMap纹理
-            createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            // 用之前创建swapChainImages时候的格式
-            createInfo.format = swapChainImageFormat;
-
-            // components字段允许调整颜色通道的最终的映射逻辑
-            // 比如，我们可以将所有颜色通道映射为红色通道，以实现单色纹理，我们也可以将通道映射具体的常量数值0和1
-            // 这里用默认的
-            createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-            createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-
-            // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域
-            // 这个图像用作填充color(可以是深度，stencil等)
-            createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            // 没有mipmap
-            createInfo.subresourceRange.baseMipLevel = 0;
-            createInfo.subresourceRange.levelCount = 1;
-            // 没有multiple layer (如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要)
-            createInfo.subresourceRange.baseArrayLayer = 0;
-            createInfo.subresourceRange.layerCount = 1;
-
-            // 创建一个VkImageView
-            if (vkCreateImageView(device, &createInfo, nullptr, &swapChainImageViews[i]) != VK_SUCCESS) {
-                throw std::runtime_error("failed to create image views!");
-            }
+            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat);
         }
+    }
+
+    VkImageView createImageView(VkImage image, VkFormat format) {
+        VkImageViewCreateInfo createInfo = {};
+        createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        // 对应的哪个VkImage
+        createInfo.image = image;
+        // 可以是1D，2D，3D或者CubeMap纹理
+        createInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        // 图片格式
+        createInfo.format = format;
+
+        // components字段允许调整颜色通道的最终的映射逻辑
+        // 比如，我们可以将所有颜色通道映射为红色通道，以实现单色纹理，我们也可以将通道映射具体的常量数值0和1
+        // 这里用默认的
+        createInfo.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+
+        // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域
+        // 这个图像用作填充color(可以是深度，stencil等)
+        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        // 没有mipmap
+        createInfo.subresourceRange.baseMipLevel = 0;
+        createInfo.subresourceRange.levelCount = 1;
+        // 没有multiple layer (如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要)
+        createInfo.subresourceRange.baseArrayLayer = 0;
+        createInfo.subresourceRange.layerCount = 1;
+
+        // 创建一个VkImageView
+        VkImageView imageView;
+        if (vkCreateImageView(device, &createInfo, nullptr, &imageView) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create image views!");
+        }
+
+        return imageView;
     }
 
     void createRenderPass() {
@@ -1428,7 +1442,7 @@ private:
     void createTextureImage() {
         // 用stb_image库读硬盘上的图片文件
         int texWidth, texHeight, texChannels;
-        stbi_uc* pixels = stbi_load("../../Textures/awesomeface.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        stbi_uc* pixels = stbi_load("../../Textures/awesomeface.png", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         VkDeviceSize imageSize = texWidth * texHeight * 4;
         if (!pixels) {
             throw std::runtime_error("failed to load texture image!");
@@ -1451,6 +1465,17 @@ private:
         // 然后再写一个VK_IMAGE_USAGE_SAMPLED_BIT表示会用于shader代码采样纹理
         // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT的意思是这个image的内存只对GPU可见，CPU不可直接访问，和申请buffer一样
         createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+
+        // 我们createImage的时候initialLayout是VK_IMAGE_LAYOUT_UNDEFINED，这里转换成接受数据的VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        // 把数据从stagingBuffer复制到image
+        copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+        // 因为我们的这个image是给shader采样用的，所以再把layout转成VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    
+        // 临时buffer立刻销毁
+        vkDestroyBuffer(device, stagingBuffer, nullptr);
+        vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
     void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
@@ -1505,6 +1530,132 @@ private:
             throw std::runtime_error("failed to allocate image memory!");
         }
         vkBindImageMemory(device, image, imageMemory, 0);
+    }
+
+    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // Vulkan里面的Barrier，在多个队列簇可能会同时使用一个资源的时候，可以用来确保资源的同步，也就是一个资源的正在写，还没写完之前禁止其他地方读写
+        // 如果是VK_SHARING_MODE_EXCLUSIVE模式，也就是说不会有多个队列簇同时访问的情况，可以用于转换image的layout，也可以用于转换队列簇的所有权
+        // 这里因为是转换image layout，所以用的是VkImageMemoryBarrier，还有一个VkBufferMemoryBarrier是类似的东西
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        // 转换前的layout，如果不关心可以用VK_IMAGE_LAYOUT_UNDEFINED
+        barrier.oldLayout = oldLayout;
+        // 转换后的layout
+        barrier.newLayout = newLayout;
+        // 这两个参数是用于转换队列簇所有权的，如果我们不做这个转换，一定要明确填入VK_QUEUE_FAMILY_IGNORED
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        // 我们要转换的图像
+        barrier.image = image;
+        // image的用途
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        // 这个image没有mipmap
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        // 这个image也不是数组
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+
+        // Barrier的主要作用是用于控制同步的
+        // 这个是指定什么操作是必须在这个Barrier之前完成的
+        // barrier.srcAccessMask = 0;
+        // 这个是指定什么操作必须要等到这个Barrier之后才能开始的
+        // barrier.dstAccessMask = 0;
+
+        // 指定应该在Barrier之前完成的操作，在管线里的哪个stage
+        VkPipelineStageFlags sourceStage;
+        // 指定应该等待Barrier的操作，在管线里的哪个stage
+        VkPipelineStageFlags destinationStage;
+        if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+            // 这个是把一个initialLayout为VK_IMAGE_LAYOUT_UNDEFINED的新image，转换为VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
+            // 因为我们要把数据从stagingBuffer复制到新的image，所以image的layout需要转换为VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL来接收数据
+
+            // 不需要任何等待和限制，可以立刻开始操作
+            barrier.srcAccessMask = 0;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT; // 这个是一个虚拟的stage，意思是最早的stage
+
+            // transfer数据的写入操作，需要在这个Barrier之后
+            // 我们这是一个layout转换指令，所以相当于从buffer拷贝数据到image的操作，需要等这个layout转换完成
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT; // 这个stage其实不是真实存在于渲染管线上的，是一个表示transfer数据操作的伪阶段
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+            // 这个组合的意思是，数据刚刚拷贝完，还是接受拷贝数据的layout，这里转换成后面要用的，给shader采样的格式
+
+            // 这个layout转换，需要等transfer数据的操作完成后再进行
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT; // 这个stage其实不是真实存在于渲染管线上的，是一个表示transfer数据操作的伪阶段
+
+            // fragment shader里的纹理采样操作需要等这个layout转换结束
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }
+        else {
+            throw std::invalid_argument("unsupported layout transition!");
+        }
+
+        vkCmdPipelineBarrier(
+            commandBuffer,
+            // 指定应该在Barrier之前完成的操作，在管线里的哪个stage
+            sourceStage,
+            // 指定应该等待Barrier的操作，在管线里的哪个stage，这两个参数可允许的stage见:https://www.khronos.org/registry/vulkan/specs/1.3-extensions/html/chap7.html#synchronization-access-types-supported
+            // 注意这里的stage需要和VkImageCreateInfo的usage匹配，你不能对一个用于shader的image填一个非图形的stage
+            destinationStage,
+            // 这个参数填0或者VK_DEPENDENCY_BY_REGION_BIT，后者意味着允许读取到目前为止已写入的资源部分(意思应该是运行写的中途去读，感觉是骚操作)
+            0,
+            // VkMemoryBarrier数组
+            0, nullptr,
+            // VkBufferMemoryBarrier数组
+            0, nullptr,
+            // VkImageMemoryBarrier数组
+            1, &barrier
+        );
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // 如果我们要从一个buffer上复制数据到image上，我们需要指定复制buffer上的哪一部分数据，到image的哪一部分
+        VkBufferImageCopy region{};
+        // 从buffer读取数据的起始偏移量
+        region.bufferOffset = 0;
+        // 这两个参数明确像素在内存里的布局方式，如果我们只是简单的紧密排列数据，就填0
+        region.bufferRowLength = 0;
+        region.bufferImageHeight = 0;
+        // 下面4个参数都是在设置我们要把数据拷贝到image的哪一部分
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        // 这个也是在设置我们要把图像拷贝到哪一部分
+        // 如果是整张图片，offset就全是0，extent就直接是图像高宽
+        region.imageOffset = { 0, 0, 0 };
+        region.imageExtent = {
+            width,
+            height,
+            1
+        };
+
+        vkCmdCopyBufferToImage(
+            commandBuffer,
+            buffer,
+            image,
+            // image当前的layout，我们假设已经是设置为专门接收数据的layout了
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            // 传递VkBufferImageCopy数组，可以在一个指令里写多个不同的数据拷贝操作
+            1, &region
+        );
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
+    void createTextureImageView() {
+        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB);
     }
 
     void createVertexBuffer() {
@@ -1976,7 +2127,7 @@ private:
         // 重新调用创建交换链的接口
         createSwapChain();
         // ImageView和FrameBuffer是依赖交换链的Image的，所以也需要重新创建一下
-        createImageViews();
+        createSwapChainImageViews();
         createFramebuffers();
     }
 
