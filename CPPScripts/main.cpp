@@ -5,6 +5,7 @@
 #include <string>
 #include <array>
 #include <chrono>
+#include <unordered_map>
 using std::string;
 
 std::ofstream ofs;
@@ -51,8 +52,14 @@ static std::vector<char> readFile(const std::string& filename) {
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+// 因为要用unordered_map存一些GLM的数据，所以加一个这个
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/hash.hpp>
+
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
 
 using namespace glm;
 
@@ -179,24 +186,21 @@ struct Vertex {
 
         return attributeDescriptions;
     }
+
+    // 用unordered_map存放这个结构体的话需要重载这个
+    bool operator==(const Vertex& other) const {
+        return pos == other.pos && color == other.color && texCoord == other.texCoord;
+    }
 };
 
-const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
-
-    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
-    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
-    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
-    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
-};
-
-const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0,
-    4, 5, 6, 6, 7, 4
-};
+// 这个也是为了用unordered_map存Vertex定义的
+namespace std {
+    template<> struct hash<Vertex> {
+        size_t operator()(Vertex const& vertex) const {
+            return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^ (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
 
 class HelloTriangleApplication {
 public:
@@ -242,6 +246,9 @@ private:
     VkCommandPool commandPool;
     // 从CommandPool里分配的，CommandPool销毁的时候会自动销毁
     std::vector<VkCommandBuffer> commandBuffers;
+    // 存放从模型文件加载出来的顶点数组的变量
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
     // 存放顶点数据的buffer，Vulkan中的buffer是用于存储可由显卡读取的任意数据的内存区域
     VkBuffer vertexBuffer;
     // 存放顶点数据的buffer所使用的内存
@@ -324,6 +331,7 @@ private:
         createTextureImage();
         createTextureImageView();
         createTextureSampler();
+        loadModel();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -398,6 +406,52 @@ private:
         vkDestroyInstance(instance, nullptr);
         glfwDestroyWindow(window);
         glfwTerminate();
+    }
+
+    void loadModel() {
+        // 所有的顶点坐标，纹理，法线，颜色等信息全都在这里面，各自有一个数组
+        // 不过这些数据不是按顶点来组织的，是各自一个数组散在这里面的
+        tinyobj::attrib_t attrib;
+        // 这个数据是按面-点存放的顶点数据，这里只有索引，具体的数据从上面那个attrib_t里面找
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn, err;
+
+        if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, "../../Models/viking_room.obj")) {
+            throw std::runtime_error(warn + err);
+        }
+
+        std::unordered_map<Vertex, uint32_t> uniqueVertices{};
+
+        for (const auto& shape : shapes) {
+            for (const auto& index : shape.mesh.indices) {
+                Vertex vertex{};
+
+                // 填入顶点位置信息
+                // 这里x3是因为默认三角形图元，索引间隔为3
+                vertex.pos = {
+                    attrib.vertices[3 * index.vertex_index + 0],
+                    attrib.vertices[3 * index.vertex_index + 1],
+                    attrib.vertices[3 * index.vertex_index + 2]
+                };
+
+                // 填入UV信息
+                vertex.texCoord = {
+                    attrib.texcoords[2 * index.texcoord_index + 0],
+                    // 因为Vulkan的坐标系问题，Y轴的采样坐标取反一下
+                    1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+                };
+
+                vertex.color = { 1.0f, 1.0f, 1.0f };
+
+                if (uniqueVertices.count(vertex) == 0) {
+                    uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+                    vertices.push_back(vertex);
+                }
+
+                indices.push_back(uniqueVertices[vertex]);
+            }
+        }
     }
 
     void createInstance() {
@@ -1583,7 +1637,7 @@ private:
     void createTextureImage() {
         // 用stb_image库读硬盘上的图片文件
         int texWidth, texHeight, texChannels;
-        stbi_uc* pixels = stbi_load("../../Textures/awesomeface.png", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+        stbi_uc* pixels = stbi_load("../../Textures/viking_room.png", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
         VkDeviceSize imageSize = texWidth * texHeight * 4;
         if (!pixels) {
             throw std::runtime_error("failed to load texture image!");
@@ -2162,7 +2216,7 @@ private:
         // 第5个参数指定了要读取对应的vertex buffer数据时，以byte为单位的偏移量
         vkCmdBindVertexBuffers(commandBuffer, 0, 1, vertexBuffers, offsets);
         // 绑定顶点索引
-        vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT16);
+        vkCmdBindIndexBuffer(commandBuffer, indexBuffer, 0, VK_INDEX_TYPE_UINT32);
         // 绑定用于描述uniform的描述符集
         // 参数2是指定我们绑定的是图形管线，因为描述符也可以用于非图形管线
         // 参数3是指我们绑定的这个管线的layout(创建管线的时候在这个layout里面填入了描述符信息)
