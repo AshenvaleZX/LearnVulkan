@@ -47,6 +47,7 @@ static std::vector<char> readFile(const std::string& filename) {
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #define GLM_FORCE_RADIANS
+// OpenGL的depth范围是-1到1，这里加宏定义转为Vulkan的0到1
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
@@ -130,8 +131,9 @@ struct UniformBufferObject {
 };
 
 struct Vertex {
-    glm::vec2 pos;
+    glm::vec3 pos;
     glm::vec3 color;
+    glm::vec2 texCoord;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
@@ -143,9 +145,9 @@ struct Vertex {
         return bindingDescription;
     }
 
-    static std::array<VkVertexInputAttributeDescription, 2> getAttributeDescriptions() {
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
         // 我们的顶点有2个数据，所以用一个长度为2的VkVertexInputAttributeDescription数组来描述属性
-        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
 
         // 不是很懂这个binding的含义，好像和Instance有关
         attributeDescriptions[0].binding = 0;
@@ -160,7 +162,7 @@ struct Vertex {
         // ivec2: VK_FORMAT_R32G32_SINT
         // uvec4: VK_FORMAT_R32G32B32A32_UINT
         // double: VK_FORMAT_R64_SFLOAT
-        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
         // 当前这个属性的偏移量
         attributeDescriptions[0].offset = offsetof(Vertex, pos);
 
@@ -170,19 +172,30 @@ struct Vertex {
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
 
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
         return attributeDescriptions;
     }
 };
 
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
+
+    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
 };
 
 const std::vector<uint16_t> indices = {
-    0, 1, 2, 2, 3, 0
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4
 };
 
 class HelloTriangleApplication {
@@ -219,6 +232,12 @@ private:
     std::vector<VkImageView> swapChainImageViews;
     // 给交换链中每一个VkImage建立一个帧缓冲区
     std::vector<VkFramebuffer> swapChainFramebuffers;
+    // 用于交换链的深度图，因为我们这个应用同一时刻好像只有一个fragment shader在写入交换链，所以一个depth就够了，不用多个
+    VkImage depthImage;
+    VkDeviceMemory depthImageMemory;
+    VkImageView depthImageView;
+
+
     // VkCommandPool是用来管理存储command buffer的内存和分配command buffer的
     VkCommandPool commandPool;
     // 从CommandPool里分配的，CommandPool销毁的时候会自动销毁
@@ -241,6 +260,8 @@ private:
     VkDeviceMemory textureImageMemory;
     // VkImage无法直接访问，需要通过VkImageView间接访问
     VkImageView textureImageView;
+    // 纹理采样器
+    VkSampler textureSampler;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
@@ -297,10 +318,12 @@ private:
         // 创建用于描述uniforms的结构体
         createDescriptorSetLayout();
         createGraphicsPipeline();
-        createFramebuffers();
         createCommandPool();
+        createDepthResources();
+        createFramebuffers();
         createTextureImage();
         createTextureImageView();
+        createTextureSampler();
         createVertexBuffer();
         createIndexBuffer();
         createUniformBuffers();
@@ -323,6 +346,10 @@ private:
     }
 
     void cleanupSwapChain() {
+        vkDestroyImageView(device, depthImageView, nullptr);
+        vkDestroyImage(device, depthImage, nullptr);
+        vkFreeMemory(device, depthImageMemory, nullptr);
+
         for (size_t i = 0; i < swapChainFramebuffers.size(); i++) {
             vkDestroyFramebuffer(device, swapChainFramebuffers[i], nullptr);
         }
@@ -335,6 +362,7 @@ private:
     void cleanup() {
         cleanupSwapChain();
 
+        vkDestroySampler(device, textureSampler, nullptr);
         vkDestroyImageView(device, textureImageView, nullptr);
         vkDestroyImage(device, textureImage, nullptr);
         vkFreeMemory(device, textureImageMemory, nullptr);
@@ -546,6 +574,10 @@ private:
         if (!deviceFeatures.geometryShader)
             return false;
 
+        // 需要支持各项异性采样
+        if (!deviceFeatures.samplerAnisotropy)
+            return false;
+
         // 查询符合条件的队列簇
         QueueFamilyIndices indices = findQueueFamilies(device);
         if (!indices.isComplete())
@@ -654,8 +686,10 @@ private:
             queueCreateInfos.push_back(queueCreateInfo);
         }
 
-        // 明确设备要使用的功能特性，暂时不需要任何特殊的功能
+        // 明确设备要使用的功能特性
         VkPhysicalDeviceFeatures deviceFeatures = {};
+        // 启用对各向异性采样的支持
+        deviceFeatures.samplerAnisotropy = VK_TRUE;
 
         // 创建逻辑设备的信息
         VkDeviceCreateInfo createInfo = {};
@@ -886,11 +920,11 @@ private:
 
         // 循环遍历swapChainImages来创建swapChainImageViews
         for (size_t i = 0; i < swapChainImages.size(); i++) {
-            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat);
+            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
         }
     }
 
-    VkImageView createImageView(VkImage image, VkFormat format) {
+    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags) {
         VkImageViewCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         // 对应的哪个VkImage
@@ -909,8 +943,8 @@ private:
         createInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
 
         // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域
-        // 这个图像用作填充color(可以是深度，stencil等)
-        createInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        // 这个图像用作填充color还是depth stencil等
+        createInfo.subresourceRange.aspectMask = aspectFlags;
         // 没有mipmap
         createInfo.subresourceRange.baseMipLevel = 0;
         createInfo.subresourceRange.levelCount = 1;
@@ -960,6 +994,19 @@ private:
         // 这里设置为PRESENT_SRC_KHR是因为我们准备直接把数据给交换链
         colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
+        // 再创建一个depth attachment，逐行注释看上面的color attachment
+        VkAttachmentDescription depthAttachment{};
+        // 使用和我们创建depthImage时一样的format
+        depthAttachment.format = findDepthFormat();
+        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        // 因为绘制完成后我们不会再使用depth buffer了，所以这里不关心
+        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
 
         // 一个单独的渲染pass可以由多个subpass组成。subpass是一系列取决于前一个pass输出结果的渲染操作序列
         // 比如说后处理效果的序列通常每一步都依赖之前的操作
@@ -975,6 +1022,11 @@ private:
         // 因为我们这个attachment是用作color buffer的，所以我们用这个COLOR_ATTACHMENT_OPTIMAL来达到最佳性能
         colorAttachmentRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
+        // depth attachment的引用
+        VkAttachmentReference depthAttachmentRef{};
+        depthAttachmentRef.attachment = 1;
+        depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
         // 描述subpass的结构体
         VkSubpassDescription subpass{};
         // 做图形渲染这里就用这个，因为Vulkan也会支持一些非图形的工作
@@ -982,19 +1034,21 @@ private:
         // 指定color buffer的引用，这个应用以及它的索引(上面的attachment = 0)现在直接对应到片元着色器里的layout(location = 0) out vec4 outColor了
         subpass.pColorAttachments = &colorAttachmentRef;
         subpass.colorAttachmentCount = 1;
-        // 除了colorAttachment，还有这些可以引用
+        // 一个subpass只能用一个depth stencil attachment，所以这里不像color attachment一样需要传数组长度
+        subpass.pDepthStencilAttachment = &depthAttachmentRef;
+        // 除了color和depth stencil，还有这些可以引用
         // pInputAttachments: 从shader中读取
         // pResolveAttachments: 用于颜色附件的多重采样
-        // pDepthStencilAttachment: 用于depth和stencil数据
         // pPreserveAttachments: 不被这个subpass使用，但是数据要保存
 
+        // 这个pass的所有attachment
+        std::array<VkAttachmentDescription, 2> attachments = { colorAttachment, depthAttachment };
         // 创建render pass的信息
         VkRenderPassCreateInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        renderPassInfo.attachmentCount = 1;
+        renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
         // 前面创建VkAttachmentReference的时候，那个索引attachment指的就是在这个pAttachments数组里的索引
-        // 这里是可以传数组的，不过我们只创建了一个，所以也只传了一个
-        renderPassInfo.pAttachments = &colorAttachment;
+        renderPassInfo.pAttachments = attachments.data();
         renderPassInfo.subpassCount = 1;
         renderPassInfo.pSubpasses = &subpass;
 
@@ -1044,14 +1098,14 @@ private:
 
         // 这里设置依赖关系中，需要等待上一个Subpass具体完成什么步骤
         // 即等待srcStageMask阶段的srcAccessMask操作完成后
-        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         // 等于0好像是需要等待这个阶段所有操作完全结束？
         dependency.srcAccessMask = 0;
 
         // 这里设置依赖关系中，下一个Subpass具体在什么步骤才开始需要等待上一个Subpass设置的步骤结束
         // 即在dstStageMask阶段的dstAccessMask步骤执行之前，需要完成前面srcXXX设置的具体步骤
-        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+        dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 
         // 填充依赖关系数组
         renderPassInfo.dependencyCount = 1;
@@ -1063,6 +1117,7 @@ private:
     }
 
     void createDescriptorSetLayout() {
+        // 用于描述uniform buffer
         VkDescriptorSetLayoutBinding uboLayoutBinding{};
         // 这个对应shader代码里面的layout(binding = 0)
         uboLayoutBinding.binding = 0;
@@ -1076,13 +1131,21 @@ private:
         // 用于贴图的，暂时用不着
         uboLayoutBinding.pImmutableSamplers = nullptr; // Optional
 
+        // 用于描述texture sampler的
+        VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+        samplerLayoutBinding.binding = 1;
+        samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        samplerLayoutBinding.descriptorCount = 1;
+        // 这个sampler是在fragment shader里用的
+        samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        samplerLayoutBinding.pImmutableSamplers = nullptr;
 
-        // 创建用于描述shader uniform变量的数据结构信息
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboLayoutBinding, samplerLayoutBinding };
+        // 把数组填入创建描述符集的结构体
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        // 只需要填入VkDescriptorSetLayoutBinding数组就行，一个VkDescriptorSetLayoutBinding就对应一个uniform
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &uboLayoutBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
 
         // 把创建出来的数据结构存放到descriptorSetLayout中
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
@@ -1092,15 +1155,18 @@ private:
 
     void createDescriptorPool() {
         // 先确定我们需要的描述符类型和数量
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        std::array<VkDescriptorPoolSize, 2> poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         // 因为我们是给uniform buffer用的，所以数量和uniform buffer数量一致
-        poolSize.descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        poolSizes[0].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
+        // sampler的描述符
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
 
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
         // 设置可能分配的descriptor sets的最大数量
         poolInfo.maxSets = static_cast<uint32_t>(MAX_FRAMES_IN_FLIGHT);
         // 可以设置为VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT来表示可以释放单个描述符集(descriptor set)
@@ -1140,30 +1206,44 @@ private:
             // 如果我们需要更新整个buffer的数据，也可以直接用VK_WHOLE_SIZE来表示整个buffer的大小
             bufferInfo.range = sizeof(UniformBufferObject);
 
+            // 用于描述sampler的结构体
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView = textureImageView;
+            imageInfo.sampler = textureSampler;
+
             // 更新描述符集需要用的结构体，是实际更新描述符的接口vkUpdateDescriptorSets的参数
-            VkWriteDescriptorSet descriptorWrite{};
-            descriptorWrite.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+            descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             // 我们要更新的描述符集
-            descriptorWrite.dstSet = descriptorSets[i];
+            descriptorWrites[0].dstSet = descriptorSets[i];
             // 不懂这个参数的含义
-            descriptorWrite.dstBinding = 0;
+            descriptorWrites[0].dstBinding = 0;
             // 描述符集是描述符的数组，这个指定我们这次要从第几个描述符开始更新
-            descriptorWrite.dstArrayElement = 0;
+            descriptorWrites[0].dstArrayElement = 0;
             // 我们要更新多少个描述符
-            descriptorWrite.descriptorCount = 1;
+            descriptorWrites[0].descriptorCount = 1;
             // 我们要更新的描述符类型
-            descriptorWrite.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             // 后面3个参数都是长度为descriptorCount的数组
             // 描述符具体是描述什么类型数据的，就填充哪一个参数
             // 我们要更新的这个描述符所描述的buffer的信息
-            descriptorWrite.pBufferInfo = &bufferInfo;
+            descriptorWrites[0].pBufferInfo = &bufferInfo;
             // 描述image用的
-            descriptorWrite.pImageInfo = nullptr; // Optional
+            descriptorWrites[0].pImageInfo = nullptr; // Optional
             // 描述这个我也不知道是什么东西用的
-            descriptorWrite.pTexelBufferView = nullptr; // Optional
+            descriptorWrites[0].pTexelBufferView = nullptr; // Optional
+
+            descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWrites[1].dstSet = descriptorSets[i];
+            descriptorWrites[1].dstBinding = 1;
+            descriptorWrites[1].dstArrayElement = 0;
+            descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWrites[1].descriptorCount = 1;
+            descriptorWrites[1].pImageInfo = &imageInfo;
 
             // 更新描述符集，这个接口接收两个数组，第一个数组是我们要更新的描述符集数组，第二个数组是用于复制描述符集数据的数组
-            vkUpdateDescriptorSets(device, 1, &descriptorWrite, 0, nullptr);
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
         }
     }
 
@@ -1330,6 +1410,23 @@ private:
             throw std::runtime_error("failed to create pipeline layout!");
         }
 
+        // 配置depth和stencil test相关操作
+        VkPipelineDepthStencilStateCreateInfo depthStencil{};
+        depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+        // 开启深度测试和写入
+        depthStencil.depthTestEnable = VK_TRUE;
+        depthStencil.depthWriteEnable = VK_TRUE;
+        // 丢弃depth更小的fragment，也就是显示更近的
+        depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+        // 用于控制只在一定depth范围内绘制fragment，一般不用这个
+        depthStencil.depthBoundsTestEnable = VK_FALSE;
+        depthStencil.minDepthBounds = 0.0f; // Optional
+        depthStencil.maxDepthBounds = 1.0f; // Optional
+        // 控制stencil操作的参数
+        depthStencil.stencilTestEnable = VK_FALSE;
+        depthStencil.front = {}; // Optional
+        depthStencil.back = {}; // Optional
+
 
         // 终于开始用上面一大堆东西构建pipeLineInfo了......
         VkGraphicsPipelineCreateInfo pipelineInfo{};
@@ -1344,7 +1441,7 @@ private:
         pipelineInfo.pViewportState = &viewportState;
         pipelineInfo.pRasterizationState = &rasterizer;
         pipelineInfo.pMultisampleState = &multisampling;
-        pipelineInfo.pDepthStencilState = nullptr; // Optional
+        pipelineInfo.pDepthStencilState = &depthStencil;
         pipelineInfo.pColorBlendState = &colorBlending;
         pipelineInfo.pDynamicState = &dynamicState;
         // layout
@@ -1399,8 +1496,9 @@ private:
         swapChainFramebuffers.resize(swapChainImageViews.size());
 
         for (size_t i = 0; i < swapChainImageViews.size(); i++) {
-            VkImageView attachments[] = {
-                swapChainImageViews[i]
+            std::array<VkImageView, 2> attachments = {
+                swapChainImageViews[i],
+                depthImageView
             };
 
             VkFramebufferCreateInfo framebufferInfo{};
@@ -1408,8 +1506,8 @@ private:
             // 指定可以兼容的render pass(大致就是这个frame buffer和指定的render pass的attachment的数量和类型需要一致)
             framebufferInfo.renderPass = renderPass;
             // 指定attach上去的VkImageView数组和数量(数组长度)
-            framebufferInfo.attachmentCount = 1;
-            framebufferInfo.pAttachments = attachments;
+            framebufferInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+            framebufferInfo.pAttachments = attachments.data();
             framebufferInfo.width = swapChainExtent.width;
             framebufferInfo.height = swapChainExtent.height;
             // layer是指定图像数组中的层数。我们的交换链图像是单个图像，因此层数为1(没看懂)
@@ -1437,6 +1535,49 @@ private:
         if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
             throw std::runtime_error("failed to create command pool!");
         }
+    }
+
+    void createDepthResources() {
+        VkFormat depthFormat = findDepthFormat();
+        // 用查到的format创建depth image
+        createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
+        // 创建depth image view
+        depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+        // 把layout转换成depth stencil专用的(这里不做这个操作也行，因为在render pass里也会处理)
+        transitionImageLayout(depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+    }
+    
+    VkFormat findDepthFormat() {
+        return findSupportedFormat(
+            // 传入我们准备用的格式，越前面的优先级越高
+            { VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT },
+            // 因为深度图不需要从CPU访问，所以TILING用OPTIMAL
+            VK_IMAGE_TILING_OPTIMAL,
+            // 需要支持的Feature是支持depth和stencil attachment
+            VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+        );
+    }
+
+    VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features) {
+        // 从这些格式中找一个硬件支持的格式出来
+        // 这里是按顺序查找的，如果硬件支持就立刻返回，所以输入参数的时候应该把优先希望获取的格式写在前面
+        for (VkFormat format : candidates) {
+            VkFormatProperties props;
+            vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
+
+            if (tiling == VK_IMAGE_TILING_LINEAR && (props.linearTilingFeatures & features) == features) {
+                return format;
+            }
+            else if (tiling == VK_IMAGE_TILING_OPTIMAL && (props.optimalTilingFeatures & features) == features) {
+                return format;
+            }
+        }
+
+        throw std::runtime_error("failed to find supported format!");
+    }
+
+    bool hasStencilComponent(VkFormat format) {
+        return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
     }
 
     void createTextureImage() {
@@ -1549,14 +1690,26 @@ private:
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         // 我们要转换的图像
         barrier.image = image;
-        // image的用途
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         // 这个image没有mipmap
         barrier.subresourceRange.baseMipLevel = 0;
         barrier.subresourceRange.levelCount = 1;
         // 这个image也不是数组
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
+        // image的用途
+        if (newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+            // 如果新的layout是这个，就表示是用作depth和stencil的
+            // mask加上depth
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            // 有时候虽然只用depth，但是也会用这个depth stencil layout，所以还得看看具体format是不是有stencil，再加stencil mask
+            if (hasStencilComponent(format)) {
+                barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+            }
+        }
+        else {
+            // 否则默认就是用作color的
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        }
 
 
         // Barrier的主要作用是用于控制同步的
@@ -1592,6 +1745,20 @@ private:
             // fragment shader里的纹理采样操作需要等这个layout转换结束
             barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
             destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        }
+        else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+            // 新建depth image的时候，把layout转成depth stencil专用的layout
+            
+            // 因为是新增depth image，所以前面没有操作，啥都不用等
+            barrier.srcAccessMask = 0;
+            sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+
+            // 深度图的读写需要等这个layout转换完成
+            barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            // depth测试发生在VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT
+            // depth写入发生在VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+            // 我们填一个更早的阶段，以确保用的时候是准备好了的
+            destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
         }
         else {
             throw std::invalid_argument("unsupported layout transition!");
@@ -1655,7 +1822,42 @@ private:
     }
 
     void createTextureImageView() {
-        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB);
+        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+    }
+
+    void createTextureSampler() {
+        VkSamplerCreateInfo samplerInfo{};
+        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+        // 设置纹理采样密度大于和小于texel密度的时候，filter图像的方式
+        samplerInfo.magFilter = VK_FILTER_LINEAR;
+        samplerInfo.minFilter = VK_FILTER_LINEAR;
+        // 设置采样超出纹理范围时的采样方式
+        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+
+        // 开启各向异性filter，如果不是性能实在不行，一般都会开
+        samplerInfo.anisotropyEnable = VK_TRUE;
+        // 查一下硬件支持多少倍的各项异性，开到最大(不用的话填1)
+        VkPhysicalDeviceProperties properties{};
+        vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+        samplerInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;
+        // 用于addressMode设置为CLAMP_TO_BORDER的时候，border到底是什么颜色，这里只能填一些固定常量，不能自己随意设置
+        samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+        // 这里填false，纹理采样坐标范围就是正常的[0, 1)，如果填true，就会变成[0, texWidth)和[0, texHeight)，绝大部分情况下都是用[0, 1)
+        samplerInfo.unnormalizedCoordinates = VK_FALSE;
+        // 一般用不到这个，某些场景，比如shadow map的percentage-closer filtering会用到
+        samplerInfo.compareEnable = VK_FALSE;
+        samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+        // mipmap设置
+        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        samplerInfo.mipLodBias = 0.0f;
+        samplerInfo.minLod = 0.0f;
+        samplerInfo.maxLod = 0.0f;
+
+        if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
+            throw std::runtime_error("failed to create texture sampler!");
+        }
     }
 
     void createVertexBuffer() {
@@ -1921,9 +2123,13 @@ private:
         // 一般来说大小(extend)是和framebuffer的attachment一致的，如果小了会浪费，大了超出去的部分是一些未定义数值
         renderPassInfo.renderArea.extent = swapChainExtent;
         // 给VK_ATTACHMENT_LOAD_OP_CLEAR定义具体的clear color
-        VkClearValue clearColor = { {{0.0f, 0.0f, 0.0f, 1.0f}} };
-        renderPassInfo.clearValueCount = 1;
-        renderPassInfo.pClearValues = &clearColor;
+        // 注意这个clearValues数组的顺序应该和attachment的顺序保持一致
+        std::array<VkClearValue, 2> clearValues{};
+        clearValues[0].color = { {0.0f, 0.0f, 0.0f, 1.0f} };
+        // Vulkan里面depth的范围是0到1，1代表最远
+        clearValues[1].depthStencil = { 1.0f, 0 };
+        renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+        renderPassInfo.pClearValues = clearValues.data();
         // 现在可以开始render pass了，所有record commands的接口都是以vkCmd为前缀的
         // 这些函数返回void，需要等到我们结束command的record后才会返回错误
         // 这里第三个参数可以是
@@ -2128,6 +2334,8 @@ private:
         createSwapChain();
         // ImageView和FrameBuffer是依赖交换链的Image的，所以也需要重新创建一下
         createSwapChainImageViews();
+        // depth buffer也要重新创建一下
+        createDepthResources();
         createFramebuffers();
     }
 
