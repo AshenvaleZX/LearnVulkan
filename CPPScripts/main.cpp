@@ -236,6 +236,10 @@ private:
     std::vector<VkImageView> swapChainImageViews;
     // 给交换链中每一个VkImage建立一个帧缓冲区
     std::vector<VkFramebuffer> swapChainFramebuffers;
+    // 因为交换链用的默认Buffer不支持MSAA，我们先把图像渲染到这里面，再弄到交换链的image上
+    VkImage colorImage;
+    VkDeviceMemory colorImageMemory;
+    VkImageView colorImageView;
     // 用于交换链的深度图，因为我们这个应用同一时刻好像只有一个fragment shader在写入交换链，所以一个depth就够了，不用多个
     VkImage depthImage;
     VkDeviceMemory depthImageMemory;
@@ -265,10 +269,14 @@ private:
     // 这个VkImage其实和VkBuffer差不多，VkImage只是专门为存储图像做了优化的VkBuffer
     VkImage textureImage;
     VkDeviceMemory textureImageMemory;
+    // 这个image的mipmap有多少级(一般通过像素高宽计算)
+    uint32_t mipLevels;
     // VkImage无法直接访问，需要通过VkImageView间接访问
     VkImageView textureImageView;
     // 纹理采样器
     VkSampler textureSampler;
+    // 我们使用的MSAA采样数量(这个还得看硬件支持多少)
+    VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
     
     VkRenderPass renderPass;
     // 这个就是glsl里面在开头写的那个layout
@@ -326,6 +334,7 @@ private:
         createDescriptorSetLayout();
         createGraphicsPipeline();
         createCommandPool();
+        createColorResources();
         createDepthResources();
         createFramebuffers();
         createTextureImage();
@@ -354,6 +363,10 @@ private:
     }
 
     void cleanupSwapChain() {
+        vkDestroyImageView(device, colorImageView, nullptr);
+        vkDestroyImage(device, colorImage, nullptr);
+        vkFreeMemory(device, colorImageMemory, nullptr);
+
         vkDestroyImageView(device, depthImageView, nullptr);
         vkDestroyImage(device, depthImage, nullptr);
         vkFreeMemory(device, depthImageMemory, nullptr);
@@ -604,6 +617,7 @@ private:
         for (const auto& device : devices) {
             if (isDeviceSuitable(device)) {
                 physicalDevice = device;
+                msaaSamples = getMaxUsableSampleCount();
                 break;
             }
         }
@@ -718,6 +732,23 @@ private:
         return indices;
     }
 
+    // 获取硬件支持的最大超采样数量(一个像素几个采样点)
+    VkSampleCountFlagBits getMaxUsableSampleCount() {
+        VkPhysicalDeviceProperties physicalDeviceProperties;
+        vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+
+        // 取同时支持Color和Depth的最大数量
+        VkSampleCountFlags counts = physicalDeviceProperties.limits.framebufferColorSampleCounts & physicalDeviceProperties.limits.framebufferDepthSampleCounts;
+        if (counts & VK_SAMPLE_COUNT_64_BIT) { return VK_SAMPLE_COUNT_64_BIT; }
+        if (counts & VK_SAMPLE_COUNT_32_BIT) { return VK_SAMPLE_COUNT_32_BIT; }
+        if (counts & VK_SAMPLE_COUNT_16_BIT) { return VK_SAMPLE_COUNT_16_BIT; }
+        if (counts & VK_SAMPLE_COUNT_8_BIT) { return VK_SAMPLE_COUNT_8_BIT; }
+        if (counts & VK_SAMPLE_COUNT_4_BIT) { return VK_SAMPLE_COUNT_4_BIT; }
+        if (counts & VK_SAMPLE_COUNT_2_BIT) { return VK_SAMPLE_COUNT_2_BIT; }
+
+        return VK_SAMPLE_COUNT_1_BIT;
+    }
+
     void createLogicalDevice() {
         // 获取当前物理设备的队列簇
         QueueFamilyIndices indices = findQueueFamilies(physicalDevice);
@@ -744,6 +775,9 @@ private:
         VkPhysicalDeviceFeatures deviceFeatures = {};
         // 启用对各向异性采样的支持
         deviceFeatures.samplerAnisotropy = VK_TRUE;
+        // 开启这个相当于开启了shader采样纹理时的MSAA(真正的MSAA只解决了不同模型边缘的锯齿问题，并不能解决模型上贴图texel太密集时候的锯齿问题)
+        // 同时需要在创建Pipeline的VkPipelineMultisampleStateCreateInfo里开启sampleShadingEnable并设置minSampleShading
+        deviceFeatures.sampleRateShading = VK_TRUE;
 
         // 创建逻辑设备的信息
         VkDeviceCreateInfo createInfo = {};
@@ -905,21 +939,14 @@ private:
     }
 
     VkSurfaceFormatKHR chooseSwapSurfaceFormat(const std::vector<VkSurfaceFormatKHR>& availableFormats) {
-        // 这是最理想的情况，surface没有设置任何偏向性的格式
-        // 这个时候Vulkan会通过仅返回一个VkSurfaceFormatKHR结构来表示，且该结构的format成员设置为VK_FORMAT_UNDEFINED
-        // 此时我们可以自由的设置格式
-        if (availableFormats.size() == 1 && availableFormats[0].format == VK_FORMAT_UNDEFINED) {
-            return { VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR };
-        }
-
-        // 如果不能自由的设置格式，那么我们可以通过遍历列表设置具有偏向性的组合
+        // 查一下有没有我们理想的格式，优先用这个
         for (const auto& availableFormat : availableFormats) {
-            if (availableFormat.format == VK_FORMAT_B8G8R8A8_UNORM && availableFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
+            if (availableFormat.format == VK_FORMAT_B8G8R8A8_SRGB && availableFormat.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR) {
                 return availableFormat;
             }
         }
 
-        // 如果以上两种方式都失效了，我们直接选择第一个格式
+        // 如果没有理想的格式，我们直接选择第一个格式
         // 其实这个时候我们也可以遍历一下availableFormats，自己写一个规则挑一个相对较好的出来
         return availableFormats[0];
     }
@@ -974,11 +1001,11 @@ private:
 
         // 循环遍历swapChainImages来创建swapChainImageViews
         for (size_t i = 0; i < swapChainImages.size(); i++) {
-            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+            swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
         }
     }
 
-    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags) {
+    VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t mipLevels) {
         VkImageViewCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         // 对应的哪个VkImage
@@ -999,9 +1026,9 @@ private:
         // subresourceRangle字段用于描述图像的使用目标是什么，以及可以被访问的有效区域
         // 这个图像用作填充color还是depth stencil等
         createInfo.subresourceRange.aspectMask = aspectFlags;
-        // 没有mipmap
+        // mipmap
         createInfo.subresourceRange.baseMipLevel = 0;
-        createInfo.subresourceRange.levelCount = 1;
+        createInfo.subresourceRange.levelCount = mipLevels;
         // 没有multiple layer (如果在编写沉浸式的3D应用程序，比如VR，就需要创建支持多层的交换链。并且通过不同的层为每一个图像创建多个视图，以满足不同层的图像在左右眼渲染时对视图的需要)
         createInfo.subresourceRange.baseArrayLayer = 0;
         createInfo.subresourceRange.layerCount = 1;
@@ -1021,8 +1048,8 @@ private:
         VkAttachmentDescription colorAttachment = {};
         // 和交换链里的图片格式保持一致
         colorAttachment.format = swapChainImageFormat;
-        // 不启用多重采样的话这里就是1bit
-        colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        // 不启用多重采样的话这里就是VK_SAMPLE_COUNT_1_BIT
+        colorAttachment.samples = msaaSamples;
         // loadOp是渲染前的操作
         // VK_ATTACHMENT_LOAD_OP_LOAD: 保存已经存在于当前buffer的内容
         // VK_ATTACHMENT_LOAD_OP_CLEAR: 起始阶段以一个常量清理内容
@@ -1045,14 +1072,15 @@ private:
         // 但是这里如果设置为UNDEFINED，是不能保证数据可以保留下来的，不过本来我们loadOp也设置成了clear，所以无所谓
         colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         // finalLayout指的是，当前render pass处理完了之后，会把数据设置为什么layout
-        // 这里设置为PRESENT_SRC_KHR是因为我们准备直接把数据给交换链
-        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        // 设置为VK_IMAGE_LAYOUT_PRESENT_SRC_KHR表示我们准备直接把数据给交换链(如果启用了MSAA，也就是samples不是1_BIT的话，是不能直接设置为这个给交换链的)
+        // 设置为VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL表示这是一个我们自己创建的frame buffer的color attachment
+        colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
         // 再创建一个depth attachment，逐行注释看上面的color attachment
         VkAttachmentDescription depthAttachment{};
         // 使用和我们创建depthImage时一样的format
         depthAttachment.format = findDepthFormat();
-        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+        depthAttachment.samples = msaaSamples;
         depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
         // 因为绘制完成后我们不会再使用depth buffer了，所以这里不关心
         depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -1060,6 +1088,18 @@ private:
         depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
         depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+
+        // 这里再创建一个color attachment拿给交换链展示图像用
+        // 我们的画面会直接渲染到前面那个color attachment，是开了MSAA的，最终拿给交换链展示的时候会去掉超采样把数据放到这里面
+        VkAttachmentDescription colorAttachmentResolve{};
+        colorAttachmentResolve.format = swapChainImageFormat;
+        colorAttachmentResolve.samples = VK_SAMPLE_COUNT_1_BIT;
+        colorAttachmentResolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachmentResolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachmentResolve.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAttachmentResolve.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        colorAttachmentResolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        colorAttachmentResolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
 
         // 一个单独的渲染pass可以由多个subpass组成。subpass是一系列取决于前一个pass输出结果的渲染操作序列
@@ -1081,22 +1121,30 @@ private:
         depthAttachmentRef.attachment = 1;
         depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
+        // 最终拿给交换链展示用的color attachment
+        VkAttachmentReference colorAttachmentResolveRef{};
+        colorAttachmentResolveRef.attachment = 2;
+        colorAttachmentResolveRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+
         // 描述subpass的结构体
         VkSubpassDescription subpass{};
         // 做图形渲染这里就用这个，因为Vulkan也会支持一些非图形的工作
         subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
         // 指定color buffer的引用，这个应用以及它的索引(上面的attachment = 0)现在直接对应到片元着色器里的layout(location = 0) out vec4 outColor了
         subpass.pColorAttachments = &colorAttachmentRef;
+        // 画面会直接渲染到这里
         subpass.colorAttachmentCount = 1;
         // 一个subpass只能用一个depth stencil attachment，所以这里不像color attachment一样需要传数组长度
         subpass.pDepthStencilAttachment = &depthAttachmentRef;
+        // 上面那个color attachment开了MSAA，不能直接拿给交换链展示，需要resolve到这里
+        // 这里貌似直接设置这个变量，Vulkan就会自己去做resolve处理了，不用我们再手动搞什么
+        subpass.pResolveAttachments = &colorAttachmentResolveRef;
         // 除了color和depth stencil，还有这些可以引用
         // pInputAttachments: 从shader中读取
-        // pResolveAttachments: 用于颜色附件的多重采样
         // pPreserveAttachments: 不被这个subpass使用，但是数据要保存
 
         // 这个pass的所有attachment
-        std::array<VkAttachmentDescription, 2> attachments = { colorAttachment, depthAttachment };
+        std::array<VkAttachmentDescription, 3> attachments = { colorAttachment, depthAttachment, colorAttachmentResolve };
         // 创建render pass的信息
         VkRenderPassCreateInfo renderPassInfo{};
         renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -1421,9 +1469,12 @@ private:
         // 设置多重采样
         VkPipelineMultisampleStateCreateInfo multisampling{};
         multisampling.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+        // 开启这个相当于开启了shader采样纹理时的MSAA(真正的MSAA只解决了不同模型边缘的锯齿问题，并不能解决模型上贴图texel太密集时候的锯齿问题)
+        // 同时需要创建逻辑设备的时候开启VkPhysicalDeviceFeatures里的sampleRateShading才能生效
         multisampling.sampleShadingEnable = VK_FALSE;
-        multisampling.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-        multisampling.minSampleShading = 1.0f; // Optional
+        // 这个是调整sampleShading效果的，越接近1效果越平滑，越接近0性能越好
+        multisampling.minSampleShading = 1.0f;
+        multisampling.rasterizationSamples = msaaSamples;
         multisampling.pSampleMask = nullptr; // Optional
         multisampling.alphaToCoverageEnable = VK_FALSE; // Optional
         multisampling.alphaToOneEnable = VK_FALSE; // Optional
@@ -1550,9 +1601,10 @@ private:
         swapChainFramebuffers.resize(swapChainImageViews.size());
 
         for (size_t i = 0; i < swapChainImageViews.size(); i++) {
-            std::array<VkImageView, 2> attachments = {
-                swapChainImageViews[i],
-                depthImageView
+            std::array<VkImageView, 3> attachments = {
+                colorImageView,
+                depthImageView,
+                swapChainImageViews[i]
             };
 
             VkFramebufferCreateInfo framebufferInfo{};
@@ -1591,14 +1643,22 @@ private:
         }
     }
 
+    void createColorResources() {
+        VkFormat colorFormat = swapChainImageFormat;
+        // 这里mipmap填1，因为Vulkan强制规定如果要开启超采样，就不能用mipmap
+        // 而且这个image是用来当作color buffer用的，不会当模型的纹理用，所以也没必要开mipmap
+        createImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, colorFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, colorImage, colorImageMemory);
+        colorImageView = createImageView(colorImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+    }
+
     void createDepthResources() {
         VkFormat depthFormat = findDepthFormat();
         // 用查到的format创建depth image
-        createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
+        createImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
         // 创建depth image view
-        depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+        depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
         // 把layout转换成depth stencil专用的(这里不做这个操作也行，因为在render pass里也会处理)
-        transitionImageLayout(depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+        transitionImageLayout(depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 1);
     }
     
     VkFormat findDepthFormat() {
@@ -1643,6 +1703,12 @@ private:
             throw std::runtime_error("failed to load texture image!");
         }
 
+        // 计算这张图的mipmap等级
+        // 通常把图片高宽缩小一半就是一级，直到缩不动
+        // 先max找出高宽像素里比较大的，然后用log2计算可以被2除几次，再向下取整就是这张图可以缩小多少次了
+        // 最后加1是因为原图也要一个等级
+        mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(texWidth, texHeight)))) + 1;
+
         // 新建一个临时的buffer给CPU写入数据，和下面的createVertexBuffer一样
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
@@ -1657,23 +1723,25 @@ private:
 
         // usage参数:
         // 这里我们要从一个stagingBuffer接收数据，所以要写一个VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        // 又因为我们要生成mipmap，需要从这个原image读数据，所以又再加一个VK_IMAGE_USAGE_TRANSFER_SRC_BIT
         // 然后再写一个VK_IMAGE_USAGE_SAMPLED_BIT表示会用于shader代码采样纹理
         // VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT的意思是这个image的内存只对GPU可见，CPU不可直接访问，和申请buffer一样
-        createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+        createImage(texWidth, texHeight, mipLevels, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
 
         // 我们createImage的时候initialLayout是VK_IMAGE_LAYOUT_UNDEFINED，这里转换成接受数据的VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
-        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
         // 把数据从stagingBuffer复制到image
         copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
-        // 因为我们的这个image是给shader采样用的，所以再把layout转成VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    
+        // 前面调用createImage创建image的时候是开启了mipmap的，但是mipmap每一层的数据需要我们自己填进去
+        // 因为我们的这个image是给shader采样用的，所以这里生成mipmap的时候会顺便把所有layout转成VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        generateMipmaps(textureImage, VK_FORMAT_R8G8B8A8_SRGB, texWidth, texHeight, mipLevels);
+
         // 临时buffer立刻销毁
         vkDestroyBuffer(device, stagingBuffer, nullptr);
         vkFreeMemory(device, stagingBufferMemory, nullptr);
     }
 
-    void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+    void createImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkSampleCountFlagBits numSamples, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
         // 创建VkImage的结构体(VkImage其实就是专门为图像存储优化过的VkBuffer)
         VkImageCreateInfo imageInfo{};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1685,7 +1753,7 @@ private:
         // depth可以大致理解为垂直轴上的像素数量，如果不是3D纹理应该都是1吧
         imageInfo.extent.depth = 1;
         // mipmap层数
-        imageInfo.mipLevels = 1;
+        imageInfo.mipLevels = mipLevels;
         // 图片数组长度?
         imageInfo.arrayLayers = 1;
         // 图片格式，需要和stagingBuffer上的数据格式，也就是stbi_load的格式一致，否则写入数据的时候要出问题
@@ -1705,8 +1773,8 @@ private:
         imageInfo.usage = usage;
         // 只在一个队列簇使用，不共享
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        // 这个只影响当作attachments使用的VkImage，所以这里填1_Bit
-        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        // 这个只影响当作attachments使用的VkImage(意思应该是，你自己创建的frame buffer才支持这个，交换链用的那个默认buffer不支持)
+        imageInfo.samples = numSamples;
         // 可以加一些标志，给特殊用途的图像做优化，比如3D的稀疏(sparse)图像
         imageInfo.flags = 0; // Optional
 
@@ -1727,7 +1795,7 @@ private:
         vkBindImageMemory(device, image, imageMemory, 0);
     }
 
-    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+    void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels) {
         VkCommandBuffer commandBuffer = beginSingleTimeCommands();
 
         // Vulkan里面的Barrier，在多个队列簇可能会同时使用一个资源的时候，可以用来确保资源的同步，也就是一个资源的正在写，还没写完之前禁止其他地方读写
@@ -1744,9 +1812,9 @@ private:
         barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         // 我们要转换的图像
         barrier.image = image;
-        // 这个image没有mipmap
+        // 这个image的mipmap
         barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.levelCount = mipLevels;
         // 这个image也不是数组
         barrier.subresourceRange.baseArrayLayer = 0;
         barrier.subresourceRange.layerCount = 1;
@@ -1875,8 +1943,146 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
+    void generateMipmaps(VkImage image, VkFormat imageFormat, int32_t texWidth, int32_t texHeight, uint32_t mipLevels) {
+        // 生成mipmap有2种方式
+        // 一种是用一些外部的接口，比如stb_image_resize，去生成每一层的图像数据，然后把每一层都当原始图像那样填入数据
+        // 我们这里用另一种方式，用vkCmdBlitImage来处理，这个是用于复制，缩放和filter图像数据的
+        // 在一个循环里，把level 0(原图)数据缩小一倍blit到level 1，然后1到2，2到3这样
+        
+        // 先检查图像格式是否支持linear blitting
+        VkFormatProperties formatProperties;
+        vkGetPhysicalDeviceFormatProperties(physicalDevice, imageFormat, &formatProperties);
+        if (!(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+            throw std::runtime_error("texture image format does not support linear blitting!");
+        }
+
+        VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+        // 因为我们Blit数据相当于要在image的内存上操作，而由于Vulkan内部的多线程设计，所以还是需要设置barrier来保证内存操作的同步
+        // 并且layout转换也需要用这个来做，逐行注释见transitionImageLayout函数
+        VkImageMemoryBarrier barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.image = image;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+        barrier.subresourceRange.levelCount = 1;
+
+        int32_t mipWidth = texWidth;
+        int32_t mipHeight = texHeight;
+        // 注意循环是从1开始的
+        for (uint32_t i = 1; i < mipLevels; i++) {
+            // 先把第i-1级(0是原图)的layout转成TRANSFER_SRC_OPTIMAL
+            barrier.subresourceRange.baseMipLevel = i - 1;
+            // 原layout，其实image一开始创建的时候每一级mipmap都设置为VK_IMAGE_LAYOUT_UNDEFINED了
+            // 但是每一级mipmap会先作为目标图像接收数据，再作为原图像向下一级传输数据
+            // 所以这里第i-1级mipmap，相当于是这一次Blit操作的原数据，也是这个循环里面第二次被使用(第一次被使用是作为目标图像)
+            // 所以这里要从TRANSFER_DST_OPTIMAL转换到TRANSFER_SRC_OPTIMAL
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            // 这个image的数据写入应该在这个Barrier之前完成
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            // 这个Barrier之后就可以读这个image的数据了
+            barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+            vkCmdPipelineBarrier(commandBuffer,
+                // 指定应该在Barrier之前完成的操作，在管线里的哪个stage
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                // 指定应该等待Barrier的操作，在管线里的哪个stage
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                // 这个参数填0或者VK_DEPENDENCY_BY_REGION_BIT，后者意味着允许读取到目前为止已写入的资源部分(意思应该是运行写的中途去读，感觉是骚操作)
+                0,
+                // VkMemoryBarrier数组
+                0, nullptr,
+                // VkBufferMemoryBarrier数组
+                0, nullptr,
+                // VkImageMemoryBarrier数组
+                1, &barrier);
+
+            // 配置Blit操作，整个Blit操作就是把同一个image第i-1级mipmap的数据缩小一半复制到第i级
+            VkImageBlit blit{};
+            // 操作原图像的(0,0)到(width, height)
+            blit.srcOffsets[0] = { 0, 0, 0 };
+            blit.srcOffsets[1] = { mipWidth, mipHeight, 1 };
+            // 操作原图像的Color
+            blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            // 操作原图像mipmap等级的i-1
+            blit.srcSubresource.mipLevel = i - 1;
+            // 暂时没用
+            blit.srcSubresource.baseArrayLayer = 0;
+            blit.srcSubresource.layerCount = 1;
+            // 复制到目标图像的(0,0)到(width/2, height/2)，如果小于1的话等于1
+            blit.dstOffsets[0] = { 0, 0, 0 };
+            blit.dstOffsets[1] = { mipWidth > 1 ? mipWidth / 2 : 1, mipHeight > 1 ? mipHeight / 2 : 1, 1 };
+            // 操作目标图像的Color
+            blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            // 复制到目标图像的mipmap等级i
+            blit.dstSubresource.mipLevel = i;
+            // 暂时没用
+            blit.dstSubresource.baseArrayLayer = 0;
+            blit.dstSubresource.layerCount = 1;
+
+            // 添加Bilt操作指令，这里原图像和目标图像设置为同一个，因为是同一个image的不同mipmap层操作
+            vkCmdBlitImage(commandBuffer,
+                image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1, &blit,
+                VK_FILTER_LINEAR);
+
+            // Blit完之后，这个Barrier所对应的i-1级mipmap就结束任务了，可以提供给shader读取了
+            // 所以layout从TRANSFER_SRC_OPTIMAL转换到SHADER_READ_ONLY_OPTIMAL
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            // 这个image第i-1级mipmap的数据读取操作应该在这个Barrier之前完成
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+            vkCmdPipelineBarrier(commandBuffer,
+                // 结合前面的srcAccessMask
+                // transfer阶段的transfer读取操作应该在这个Barrier之前执行
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 
+                // 结合前面的dstAccessMask
+                // fragment shader阶段的shader读取操作应该在这个Barrier之后执行
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0, nullptr,
+                0, nullptr,
+                1, &barrier);
+
+            if (mipWidth > 1) mipWidth /= 2;
+            if (mipHeight > 1) mipHeight /= 2;
+        }
+
+        // 循环结束后还有最后一级的mipmap需要处理
+        barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+        // 因为最后一级只接收数据，不需要从它复制数据到其它地方，所以最后的layout就是TRANSFER_DST_OPTIMAL
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        // 需要转换成shader读取用的SHADER_READ_ONLY_OPTIMAL
+        barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        // 这个Barrier之前需要完成最后一级mipmap的数据写入
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        // shader读取数据需要在这个Barrier之后才能开始
+        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+        vkCmdPipelineBarrier(commandBuffer,
+            // 结合前面的srcAccessMask
+            // transfer阶段的transfer写入操作应该在这个Barrier之前执行
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 
+            // 结合前面的dstAccessMask
+            // fragment shader阶段的读取操作需要在这个Barrier之后才能开始
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0,
+            0, nullptr,
+            0, nullptr,
+            1, &barrier);
+
+        endSingleTimeCommands(commandBuffer);
+    }
+
     void createTextureImageView() {
-        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+        textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT, mipLevels);
     }
 
     void createTextureSampler() {
@@ -1907,7 +2113,7 @@ private:
         samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         samplerInfo.mipLodBias = 0.0f;
         samplerInfo.minLod = 0.0f;
-        samplerInfo.maxLod = 0.0f;
+        samplerInfo.maxLod = static_cast<float>(mipLevels);
 
         if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
             throw std::runtime_error("failed to create texture sampler!");
@@ -2388,6 +2594,8 @@ private:
         createSwapChain();
         // ImageView和FrameBuffer是依赖交换链的Image的，所以也需要重新创建一下
         createSwapChainImageViews();
+        // color buffer重建一下
+        createColorResources();
         // depth buffer也要重新创建一下
         createDepthResources();
         createFramebuffers();
