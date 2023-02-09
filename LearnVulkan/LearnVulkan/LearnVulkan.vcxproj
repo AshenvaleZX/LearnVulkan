@@ -133,6 +133,7 @@
   <ItemGroup>
     <ClCompile Include="..\..\CPPScripts\main.cpp" />
     <ClCompile Include="..\..\CPPScripts\RenderAPI.cpp" />
+    <ClCompile Include="..\..\CPPScripts\RenderAPI_Internal.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\..\CPPScripts\pubh.h" />
