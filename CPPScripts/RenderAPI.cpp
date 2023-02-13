@@ -36,6 +36,7 @@ RenderAPI::RenderAPI()
     CreateDebugMessenger();
     CreatePhysicalDevice();
     CreateLogicalDevice();
+    CreateMemoryAllocator();
     CreateSurface();
     CreateSwapChain();
 }

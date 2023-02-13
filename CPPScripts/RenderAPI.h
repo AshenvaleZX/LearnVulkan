@@ -3,6 +3,7 @@
 // 用GLFW的话这里就不要自己去include Vulkan的头文件，用这个宏定义，让GLFW自己去处理，不然有些接口有问题
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
+#include "vk_mem_alloc.h"
 
 // 需要的验证层
 const vector<const char*> validationLayers = 
@@ -51,7 +52,7 @@ public:
     GLFWwindow* window = nullptr;
     bool windowResized = false;
 
-	RenderAPI() {};
+	RenderAPI();
 	~RenderAPI() {};
 
 private:
@@ -68,6 +69,8 @@ private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     // 逻辑设备
     VkDevice device = VK_NULL_HANDLE;
+    // Vulkan Memory Allocator(来自AMD的GPUOpen团队:https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator)
+    VmaAllocator vmaAllocator;
     // Surface
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     // 图形队列
@@ -91,6 +94,7 @@ private:
     void CreateDebugMessenger();
     void CreatePhysicalDevice();
     void CreateLogicalDevice();
+    void CreateMemoryAllocator();
     void CreateSurface();
     void CreateSwapChain();
 

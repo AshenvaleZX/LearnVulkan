@@ -1,4 +1,6 @@
 #include "RenderAPI.h"
+#define VMA_IMPLEMENTATION
+#include "vk_mem_alloc.h"
 
 // 自定义的Debug回调函数，VKAPI_ATTR和VKAPI_CALL确保了正确的函数签名，从而被Vulkan调用
 static VKAPI_ATTR VkBool32 VKAPI_CALL VkDebugCallback(VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity, VkDebugUtilsMessageTypeFlagsEXT messageType, const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData, void* pUserData)
@@ -153,6 +155,16 @@ void RenderAPI::CreateLogicalDevice()
     // 因为我们只是从这个队列簇创建一个队列，所以需要使用索引0
     vkGetDeviceQueue(device, indices.graphicsFamilyIdx, 0, &graphicsQueue);
     vkGetDeviceQueue(device, indices.presentFamilyIdx, 0, &presentQueue);
+}
+
+void RenderAPI::CreateMemoryAllocator()
+{
+    VmaAllocatorCreateInfo vmaInfo = {};
+    vmaInfo.vulkanApiVersion = VK_HEADER_VERSION_COMPLETE;
+    vmaInfo.instance = vkInstance;
+    vmaInfo.physicalDevice = physicalDevice;
+    vmaInfo.device = device;
+    vmaCreateAllocator(&vmaInfo, &vmaAllocator);
 }
 
 void RenderAPI::CreateSurface() {
